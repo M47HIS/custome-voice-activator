@@ -1,0 +1,23 @@
+services:
+  voice-backend:
+    build: ./backend
+    container_name: voice-module-backend
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - voice-module-data:/data
+    environment:
+      - DATA_DIR=/data
+      - ENGINE=${ENGINE:-voxtral}
+      - LANGUAGE=${LANGUAGE:-en}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/status"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  voice-module-data:
+    driver: local

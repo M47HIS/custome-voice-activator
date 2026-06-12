@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Voice Module — Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header">
+            <h1 class="title">Voice Module</h1>
+            <span id="status-badge" class="status-badge idle">Idle</span>
+        </header>
+
+        <!-- Main grid -->
+        <div class="grid">
+            <!-- Waveform visualization — prominent -->
+            <section class="card waveform-card">
+                <h2 class="card-title">Microphone</h2>
+                <canvas id="waveform" class="waveform-canvas"></canvas>
+                <div class="waveform-label" id="waveform-label">Waiting for client...</div>
+            </section>
+
+            <!-- Status — compact -->
+            <section class="card status-card">
+                <h2 class="card-title">System Status</h2>
+                <div class="status-grid">
+                    <div class="status-item">
+                        <span class="status-label">Engine</span>
+                        <span class="status-value mono" id="engine-info">voxtral</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Connected</span>
+                        <span class="status-value mono" id="connected-count">0</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Last activity</span>
+                        <span class="status-value mono" id="last-activity">—</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="status-label">Actions loaded</span>
+                        <span class="status-value mono" id="actions-loaded">0</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Actions — compact -->
+            <section class="card actions-card">
+                <h2 class="card-title">Actions</h2>
+                <div id="actions-list" class="actions-list"></div>
+                <button id="btn-add-action" class="btn btn-primary">Add action</button>
+            </section>
+
+            <!-- Transcription history — compact -->
+            <section class="card history-card">
+                <h2 class="card-title">History</h2>
+                <div id="history-list" class="history-list">
+                    <div class="history-empty">Transcriptions will appear here after your first recording.</div>
+                </div>
+                <a id="view-all-link" class="view-all hidden" href="#">View all</a>
+            </section>
+        </div>
+
+        <!-- Footer -->
+        <footer class="footer">
+            <span>Voice Module v2.0.0</span>
+            <span class="footer-sep">·</span>
+            <span>MIT License</span>
+        </footer>
+    </div>
+
+    <!-- Action Editor Modal -->
+    <div id="modal-overlay" class="modal-overlay hidden">
+        <div class="modal">
+            <div class="modal-header">
+                <h3 id="modal-title">Add action</h3>
+                <button id="btn-modal-close" class="btn-close" aria-label="Close">&times;</button>
+            </div>
+            <form id="action-form" class="modal-body">
+                <input type="hidden" id="action-old-name">
+
+                <label for="action-name">Name <span class="required">*</span></label>
+                <input type="text" id="action-name" placeholder="opencode" required>
+
+                <label for="action-desc">Description</label>
+                <input type="text" id="action-desc" placeholder="What does this action do?">
+
+                <label for="action-type">Type <span class="required">*</span></label>
+                <select id="action-type" required>
+                    <option value="terminal_command">Terminal Command</option>
+                    <option value="clipboard">Clipboard</option>
+                    <option value="open_app">Open App</option>
+                    <option value="http_request">HTTP Request</option>
+                </select>
+
+                <div id="config-fields" class="config-fields"></div>
+
+                <div class="modal-actions">
+                    <button type="button" id="btn-modal-cancel" class="btn btn-secondary">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

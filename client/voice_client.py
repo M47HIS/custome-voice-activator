@@ -1,0 +1,966 @@
+#!/usr/bin/env python3
+"""
+Voice Module Client — macOS native hotkey + audio capture + Voxtral transcription.
+
+Captures audio via hotkey, transcribes locally using Voxtral (Apple MLX),
+then executes configured actions. Connects to the lightweight Docker backend
+via WebSocket for coordination, status reporting, and action configuration.
+
+Voxtral runs on Apple Neural Engine — no cloud, no Docker GPU needed.
+
+Usage:
+    python3 client/voice_client.py
+    python3 client/voice_client.py --hotkey "ctrl+alt+o" --action opencode
+    python3 client/voice_client.py --backend ws://localhost:8080/ws
+"""
+
+import argparse
+import json
+import logging
+import os
+import signal
+import subprocess
+import sys
+import threading
+import tempfile
+import time
+import wave
+from pathlib import Path
+
+import numpy as np
+
+# ── Logging ────────────────────────────────────────────────────────────────────
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("voice-client")
+
+# ── Dependency checks ──────────────────────────────────────────────────────────
+_MISSING: list[str] = []
+
+try:
+    import sounddevice as sd  # noqa: F401
+except ImportError:
+    _MISSING.append("sounddevice")
+
+try:
+    from pynput import keyboard as pynput_keyboard  # noqa: F401
+except ImportError:
+    _MISSING.append("pynput")
+
+try:
+    import websocket  # noqa: F401
+except ImportError:
+    _MISSING.append("websocket-client")
+
+try:
+    import requests  # noqa: F401
+except ImportError:
+    _MISSING.append("requests")
+
+_voxtral_available = True
+try:
+    from mlx_audio.stt.utils import load as mlx_load
+except ImportError:
+    _voxtral_available = False
+    log.warning("mlx-audio not installed. Voxtral transcription unavailable.")
+    log.warning("Install with: pip install mlx-audio")
+    log.warning("Will fall back to backend transcription if available.")
+
+if _MISSING:
+    print(f"ERROR: Missing packages: {', '.join(_MISSING)}")
+    print("Run: pip3 install -r client/requirements.txt")
+    sys.exit(1)
+
+# ── Configuration ──────────────────────────────────────────────────────────────
+
+DEFAULT_CONFIG: dict = {
+    "hotkey": "cmd+shift+space",
+    "mode": "hold",
+    "sample_rate": 16000,
+    "language": "en",
+    "beep": True,
+    "min_duration": 0.3,
+    "debug": False,
+    "backend_url": "ws://localhost:8080/ws",
+    "backend_http": "http://localhost:8080",
+    "action": "opencode",  # default action name
+    "engine": "voxtral",   # voxtral (local MLX) or backend (faster-whisper fallback)
+    "auth_token": "",      # backend auth token (fetched automatically on first run)
+}
+
+CONFIG_DIR = Path.home() / ".config" / "voice-module"
+CONFIG_PATH = CONFIG_DIR / "config.json"
+
+# Backward compat: existing config keys
+CONFIG_MAP = {
+    "hotkey": "hotkey",
+    "mode": "mode",
+    "sample_rate": "sample_rate",
+    "language": "language",
+    "beep": "beep",
+    "min_duration": "min_duration",
+    "debug": "debug",
+}
+
+
+def load_config(cli_overrides: dict | None = None) -> dict:
+    """Load config from JSON file, creating defaults if missing."""
+    if CONFIG_PATH.exists():
+        try:
+            with open(CONFIG_PATH) as f:
+                cfg = json.load(f)
+        except (json.JSONDecodeError, PermissionError):
+            log.warning(f"Could not parse {CONFIG_PATH}, using defaults.")
+            cfg = {}
+    else:
+        log.info(f"Creating default config at {CONFIG_PATH}")
+        merged = {**DEFAULT_CONFIG}
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(merged, f, indent=2)
+        cfg = {}
+
+    # Map old config keys to new ones (backward compat)
+    mapped = {}
+    for old_key, new_key in CONFIG_MAP.items():
+        if old_key in cfg:
+            mapped[new_key] = cfg[old_key]
+
+    # Merge: defaults < file config < CLI overrides
+    merged = {**DEFAULT_CONFIG, **cfg, **mapped}
+    if cli_overrides:
+        merged.update({k: v for k, v in cli_overrides.items() if v is not None})
+    return merged
+
+
+def save_config(cfg: dict) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+# ── Hotkey parsing ────────────────────────────────────────────────────────────
+
+_MODIFIER_MAP: dict[str, pynput_keyboard.Key] = {
+    "cmd": pynput_keyboard.Key.cmd,
+    "command": pynput_keyboard.Key.cmd,
+    "ctrl": pynput_keyboard.Key.ctrl,
+    "control": pynput_keyboard.Key.ctrl,
+    "alt": pynput_keyboard.Key.alt,
+    "option": pynput_keyboard.Key.alt,
+    "shift": pynput_keyboard.Key.shift,
+}
+
+_SPECIAL_KEYS: dict[str, pynput_keyboard.Key] = {
+    "space": pynput_keyboard.Key.space,
+    "tab": pynput_keyboard.Key.tab,
+    "enter": pynput_keyboard.Key.enter,
+    "return": pynput_keyboard.Key.enter,
+    "esc": pynput_keyboard.Key.esc,
+    "escape": pynput_keyboard.Key.esc,
+    "backspace": pynput_keyboard.Key.backspace,
+    "delete": pynput_keyboard.Key.delete,
+    "up": pynput_keyboard.Key.up,
+    "down": pynput_keyboard.Key.down,
+    "left": pynput_keyboard.Key.left,
+    "right": pynput_keyboard.Key.right,
+    "home": pynput_keyboard.Key.home,
+    "end": pynput_keyboard.Key.end,
+    "page_up": pynput_keyboard.Key.page_up,
+    "page_down": pynput_keyboard.Key.page_down,
+}
+
+for _n in range(1, 21):
+    _SPECIAL_KEYS[f"f{_n}"] = getattr(pynput_keyboard.Key, f"f{_n}")
+
+
+def parse_hotkey(hotkey_str: str) -> tuple[set[pynput_keyboard.Key], pynput_keyboard.Key]:
+    """Parse 'cmd+shift+space' → (modifiers, trigger)."""
+    parts = [p.strip().lower() for p in hotkey_str.split("+")]
+    modifiers: set[pynput_keyboard.Key] = set()
+    key: pynput_keyboard.Key | None = None
+
+    for part in parts:
+        if part in _MODIFIER_MAP:
+            modifiers.add(_MODIFIER_MAP[part])
+        elif part in _SPECIAL_KEYS:
+            key = _SPECIAL_KEYS[part]
+        elif len(part) == 1:
+            key = pynput_keyboard.KeyCode.from_char(part)
+        else:
+            raise ValueError(f"Unknown key: '{part}'")
+
+    if key is None:
+        raise ValueError(f"No trigger key found in '{hotkey_str}'.")
+    if not modifiers:
+        raise ValueError(f"No modifiers in '{hotkey_str}'.")
+    return modifiers, key
+
+
+def _normalize_key(key) -> pynput_keyboard.Key | pynput_keyboard.KeyCode:
+    mapping = {
+        pynput_keyboard.Key.cmd_r: pynput_keyboard.Key.cmd,
+        pynput_keyboard.Key.ctrl_r: pynput_keyboard.Key.ctrl,
+        pynput_keyboard.Key.alt_r: pynput_keyboard.Key.alt,
+        pynput_keyboard.Key.shift_r: pynput_keyboard.Key.shift,
+    }
+    return mapping.get(key, key)
+
+
+# ── Audio Recorder ────────────────────────────────────────────────────────────
+
+class AudioRecorder:
+    """Captures mono int16 audio from the default mic at a given sample rate."""
+
+    def __init__(self, sample_rate: int = 16000):
+        self.sample_rate = sample_rate
+        self._buffer: list[np.ndarray] = []
+        self._stream: sd.InputStream | None = None
+        self._recording = False
+        self._lock = threading.Lock()
+
+    def _callback(self, indata: np.ndarray, frames: int, time_info, status):
+        if status:
+            log.warning(f"Audio status: {status}")
+        with self._lock:
+            if self._recording:
+                # Convert float32 [-1,1] to int16 and store as bytes
+                int_data = (indata[:, 0].clip(-1, 1) * 32767).astype(np.int16)
+                self._buffer.append(int_data.tobytes())
+
+    def start(self) -> None:
+        with self._lock:
+            if self._recording:
+                return
+            self._buffer.clear()
+            self._recording = True
+
+        self._stream = sd.InputStream(
+            samplerate=self.sample_rate,
+            channels=1,
+            dtype=np.float32,
+            callback=self._callback,
+        )
+        try:
+            self._stream.start()
+        except Exception:
+            self._stream.close()
+            self._stream = None
+            with self._lock:
+                self._recording = False
+                self._buffer.clear()
+            raise
+
+    def stop(self) -> list[bytes]:
+        with self._lock:
+            self._recording = False
+
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+
+        with self._lock:
+            chunks = list(self._buffer)
+            self._buffer.clear()
+            return chunks
+
+    @property
+    def is_recording(self) -> bool:
+        with self._lock:
+            return self._recording
+
+
+# ── Voxtral Transcriber ───────────────────────────────────────────────────────
+
+VOXTRAL_MODEL_ID = "mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit"
+
+
+class VoxtralTranscriber:
+    """Local transcription using Voxtral via Apple MLX (Apple Neural Engine).
+
+    Lazy-loads the model on first use. Converts raw PCM int16 chunks
+    to a temporary WAV file, then calls model.generate().
+    """
+
+    def __init__(self, sample_rate: int = 16000):
+        self.sample_rate = sample_rate
+        self._model = None
+        self._loaded = False
+        self._load_error: str | None = None
+        self._lock = threading.Lock()
+
+    @property
+    def available(self) -> bool:
+        """Check if mlx-audio is importable."""
+        return _voxtral_available
+
+    def _ensure_loaded(self):
+        """Lazy-load the Voxtral model thread-safely."""
+        if self._loaded:
+            return
+        with self._lock:
+            if self._loaded:
+                return
+            try:
+                log.info(f"Loading Voxtral model: {VOXTRAL_MODEL_ID}")
+                log.info("(first run downloads the model — this may take a moment)")
+                self._model = mlx_load(VOXTRAL_MODEL_ID)
+                self._loaded = True
+                log.info("Voxtral model loaded successfully.")
+            except Exception as e:
+                self._load_error = str(e)
+                log.error(f"Voxtral model load failed: {e}")
+                raise
+
+    def transcribe(self, audio_bytes: bytes, language: str = "en") -> str:
+        """Transcribe raw PCM int16 mono audio bytes.
+
+        Returns the transcribed text string, or empty string if nothing detected.
+        """
+        if not audio_bytes:
+            log.warning("Empty audio buffer — nothing to transcribe.")
+            return ""
+
+        self._ensure_loaded()
+
+        # Convert int16 bytes → numpy for duration calculation
+        samples = np.frombuffer(audio_bytes, dtype=np.int16)
+
+        duration = len(samples) / self.sample_rate
+        log.info(f"Transcribing {duration:.1f}s with Voxtral...")
+
+        # Write to temp WAV file
+        tmp_path = None
+        try:
+            fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="voxtral_")
+            os.close(fd)
+            with wave.open(tmp_path, "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)  # 16-bit
+                wf.setframerate(self.sample_rate)
+                wf.writeframes(samples.tobytes())
+
+            result = self._model.generate(tmp_path)
+            text = result.text.strip()
+
+            if text:
+                log.info(f'Voxtral result: "{text}"')
+            else:
+                log.info("No speech detected by Voxtral.")
+
+            return text
+
+        except Exception as e:
+            log.error(f"Voxtral transcription failed: {e}")
+            raise
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+
+
+# ── WebSocket Backend Client (Lightweight Coordination) ───────────────────────
+
+class BackendClient:
+    """Connects to the Voice Module backend via WebSocket for coordination.
+
+    The backend no longer handles transcription — it serves as a status relay,
+    action config provider, and history logger. Transcription happens locally
+    in the client via Voxtral.
+    """
+
+    def __init__(self, ws_url: str, http_url: str):
+        self.ws_url = ws_url
+        self.http_url = http_url
+        self.ws: websocket.WebSocketApp | None = None
+        self._connected = False
+        self._ready = threading.Event()
+        self._lock = threading.Lock()
+        self._ws_thread: threading.Thread | None = None
+
+    def connect(self) -> bool:
+        """Connect to the backend WebSocket. Returns True if connected."""
+        self._connected = False
+        self._ready.clear()
+
+        def on_open(ws):
+            log.info("Connected to backend WebSocket")
+            with self._lock:
+                self._connected = True
+            self._ready.set()
+            # Register as client
+            ws.send(json.dumps({"type": "hello", "role": "client"}))
+
+        def on_message(ws, message):
+            try:
+                data = json.loads(message)
+                msg_type = data.get("type")
+                if msg_type == "welcome":
+                    log.info(f"Backend welcome: engine={data.get('engine')}")
+                elif msg_type == "status":
+                    log.debug(f"Server state: {data.get('state')}")
+                elif msg_type == "pong":
+                    pass
+            except json.JSONDecodeError:
+                log.debug("Non-JSON WS message")
+
+        def on_error(ws, error):
+            log.error(f"WebSocket error: {error}")
+            with self._lock:
+                self._connected = False
+            self._ready.set()
+
+        def on_close(ws, close_status_code, close_msg):
+            log.info(f"WebSocket closed: {close_status_code}")
+            with self._lock:
+                self._connected = False
+            self._ready.set()
+
+        self.ws = websocket.WebSocketApp(
+            self.ws_url,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+        )
+
+        self._ws_thread = threading.Thread(
+            target=lambda: self.ws.run_forever(ping_interval=30, ping_timeout=10),
+            daemon=True,
+        )
+        self._ws_thread.start()
+
+        # Wait for connection
+        if not self._ready.wait(timeout=10):
+            log.error("Timed out connecting to backend")
+            return False
+
+        time.sleep(0.3)
+        return self._connected
+
+    def is_connected(self) -> bool:
+        with self._lock:
+            return self._connected and self.ws is not None
+
+    def send_message(self, data: dict) -> None:
+        """Send a JSON message via WebSocket."""
+        if self.is_connected():
+            with self._lock:
+                if self.ws:
+                    self.ws.send(json.dumps(data))
+
+    def send_status(self, state: str) -> None:
+        """Send a status update to the backend."""
+        self.send_message({"type": "status", "state": state})
+
+    def send_transcription(self, text: str) -> None:
+        """Send a transcription result to the backend for history/logging."""
+        self.send_message({
+            "type": "transcription",
+            "text": text,
+            "is_final": True,
+        })
+
+    def check_backend(self) -> bool:
+        """Check if the backend HTTP server is reachable."""
+        try:
+            resp = requests.get(f"{self.http_url}/api/status", timeout=3)
+            return resp.status_code == 200
+        except requests.RequestException:
+            return False
+
+
+# ── Action Runner ─────────────────────────────────────────────────────────────
+
+class ActionRunner:
+    """Executes configured actions with transcribed text."""
+
+    def __init__(self, http_url: str, auth_token: str = ""):
+        self.http_url = http_url
+        self._actions: list[dict] = []
+        self.auth_token = auth_token
+
+    @property
+    def _auth_headers(self) -> dict:
+        """Headers to include in authenticated mutation requests."""
+        if self.auth_token:
+            return {"Authorization": f"Bearer {self.auth_token}"}
+        return {}
+
+    def fetch_actions(self) -> list[dict]:
+        """Fetch actions from the backend API."""
+        try:
+            resp = requests.get(f"{self.http_url}/api/actions", timeout=5)
+            if resp.status_code == 200:
+                self._actions = resp.json()
+                return self._actions
+        except requests.RequestException as e:
+            log.warning(f"Could not fetch actions from backend: {e}")
+        return self._actions
+
+    def get_action(self, name: str) -> dict | None:
+        """Get a specific action by name."""
+        for action in self._actions:
+            if action["name"] == name:
+                return action
+        return None
+
+    def execute(self, action: dict, text: str) -> bool:
+        """Execute an action with the transcribed text. Returns True on success."""
+        action_type = action.get("type", "")
+        config = action.get("config", {})
+
+        log.info(f"Executing action '{action.get('name')}' (type={action_type})")
+
+        try:
+            if action_type == "terminal_command":
+                return self._run_terminal(text, config)
+            elif action_type == "clipboard":
+                return self._copy_clipboard(text)
+            elif action_type == "open_app":
+                return self._open_app(text, config)
+            elif action_type == "http_request":
+                return self._http_request(text, config)
+            else:
+                log.error(f"Unknown action type: {action_type}")
+                return False
+        except Exception as e:
+            log.error(f"Action execution failed: {e}")
+            return False
+
+    def _run_terminal(self, text: str, config: dict) -> bool:
+        command = config.get("command", "echo {text}")
+        paste = config.get("paste_text", True)
+
+        safe_text = text.replace('"', '\\"')
+        command = command.replace("{text}", safe_text)
+
+        if paste:
+            subprocess.run(["pbcopy"], input=text.encode(), check=True)
+            applescript = f'''
+            tell application "Terminal"
+                activate
+                do script "{command}"
+            end tell
+            delay 0.4
+            tell application "System Events"
+                tell process "Terminal"
+                    keystroke "v" using command down
+                    delay 0.1
+                    keystroke return
+                end tell
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", applescript], check=True)
+        else:
+            escaped = command.replace("\\", "\\\\").replace('"', '\\"')
+            applescript = f'''
+            tell application "Terminal"
+                activate
+                do script "{escaped}"
+            end tell
+            '''
+            subprocess.run(["osascript", "-e", applescript], check=True)
+
+        log.info(f"Terminal command executed: {command[:60]}...")
+        return True
+
+    def _copy_clipboard(self, text: str) -> bool:
+        subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        log.info("Text copied to clipboard")
+        notify("Voice Module", "Text copied to clipboard")
+        return True
+
+    def _open_app(self, text: str, config: dict) -> bool:
+        app = config.get("app", "Notes")
+        applescript = f'''
+        tell application "{app}"
+            activate
+        end tell
+        '''
+        subprocess.run(["osascript", "-e", applescript], check=True)
+        subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        log.info(f"Opened {app}, text copied to clipboard")
+        return True
+
+    def _http_request(self, text: str, config: dict) -> bool:
+        url = config.get("url", "").replace("{text}", text)
+        method = config.get("method", "POST").upper()
+        headers = config.get("headers", {})
+        body_template = config.get("body_template", '{"text": "{text}"}')
+        body = body_template.replace("{text}", text.replace('"', '\\"'))
+
+        try:
+            body_json = json.loads(body)
+            resp = requests.request(method, url, json=body_json, headers=headers, timeout=10)
+        except json.JSONDecodeError:
+            resp = requests.request(method, url, data=body, headers=headers, timeout=10)
+
+        log.info(f"HTTP {method} {url} → {resp.status_code}")
+        return resp.ok
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def beep() -> None:
+    subprocess.run(["osascript", "-e", "beep"], capture_output=True)
+
+
+def notify(title: str, text: str = "") -> None:
+    safe_title = title.replace('"', '\\"')
+    safe_text = text.replace('"', '\\"')
+    cmd = f'display notification "{safe_text}" with title "{safe_title}"'
+    subprocess.run(["osascript", "-e", cmd], capture_output=True)
+
+
+# ── Voice Client ──────────────────────────────────────────────────────────────
+
+class VoiceClient:
+    """macOS client: hotkey → mic → Voxtral transcription → WebSocket → action."""
+
+    def __init__(self, config: dict):
+        self.cfg = config
+        self.recorder = AudioRecorder(sample_rate=config["sample_rate"])
+        self.backend = BackendClient(config["backend_url"], config["backend_http"])
+        self.runner = ActionRunner(config["backend_http"], auth_token=config.get("auth_token", ""))
+
+        # Voxtral transcriber (lazy-loaded)
+        self._transcriber: VoxtralTranscriber | None = None
+        self._use_voxtral = (
+            config.get("engine", "voxtral") == "voxtral" and _voxtral_available
+        )
+
+        self._mods: set[pynput_keyboard.Key] = set()
+        self._trigger: pynput_keyboard.Key | None = None
+        self._held: set[pynput_keyboard.Key] = set()
+        self._trigger_held = False
+        self._running = False
+        self._listener: pynput_keyboard.Listener | None = None
+        self._action: dict | None = None
+
+    # ── hotkey state ──────────────────────────────────────────────────────
+
+    def _hotkey_active(self) -> bool:
+        if not self._trigger_held:
+            return False
+        return self._mods.issubset(self._held)
+
+    # ── pynput callbacks ──────────────────────────────────────────────────
+
+    def _on_press(self, key):
+        if not self._running:
+            return
+        norm = _normalize_key(key)
+        self._held.add(norm)
+
+        is_trigger = (norm == _normalize_key(self._trigger)) or (key == self._trigger)
+
+        was_trigger_held = self._trigger_held
+
+        if is_trigger:
+            self._trigger_held = True
+
+        if self._hotkey_active():
+            if not self.recorder.is_recording:
+                self._start_recording()
+            elif self.cfg["mode"] == "toggle" and not was_trigger_held:
+                # Only toggle on fresh press (not macOS key repeat while held)
+                self._stop_recording()
+
+    def _on_release(self, key):
+        if not self._running:
+            return
+        norm = _normalize_key(key)
+        self._held.discard(norm)
+
+        is_trigger = (norm == _normalize_key(self._trigger)) or (key == self._trigger)
+        if is_trigger:
+            self._trigger_held = False
+
+        if self.cfg["mode"] == "hold":
+            if self.recorder.is_recording and not self._hotkey_active():
+                self._stop_recording()
+
+    # ── recording lifecycle ───────────────────────────────────────────────
+
+    def _start_recording(self):
+        try:
+            self.recorder.start()
+            if self.cfg["beep"]:
+                threading.Thread(target=beep, daemon=True).start()
+            if self.backend.is_connected():
+                self.backend.send_status("listening")
+            notify("Voice Module", "Recording... (release to transcribe)")
+            log.info("Recording started")
+        except Exception as e:
+            log.error(f"Recording start error: {e}")
+            notify("Voice Module Error", str(e))
+
+    def _stop_recording(self):
+        log.info("Recording stopped")
+        audio_chunks = self.recorder.stop()
+
+        duration = sum(len(c) for c in audio_chunks) / 2 / self.cfg["sample_rate"]
+        if duration < self.cfg["min_duration"]:
+            log.info(f"Recording too short ({duration:.1f}s) — skipped.")
+            notify("Voice Module", "Recording too short — skipped.")
+            if self.backend.is_connected():
+                self.backend.send_status("idle")
+            return
+
+        log.info(f"Captured ~{duration:.1f}s, transcribing...")
+        notify("Voice Module", "Transcribing...")
+
+        if self.backend.is_connected():
+            self.backend.send_status("transcribing")
+
+        text: str | None = None
+
+        if self._use_voxtral:
+            # ── Voxtral local transcription ──
+            try:
+                if self._transcriber is None:
+                    self._transcriber = VoxtralTranscriber(
+                        sample_rate=self.cfg["sample_rate"]
+                    )
+                raw = b"".join(audio_chunks)
+                text = self._transcriber.transcribe(raw, language=self.cfg["language"])
+
+                # Send result to backend for history/logging
+                if self.backend.is_connected():
+                    if text:
+                        self.backend.send_transcription(text)
+                    else:
+                        self.backend.send_message({
+                            "type": "transcription",
+                            "text": "",
+                            "is_final": True,
+                            "empty": True,
+                        })
+            except Exception as e:
+                log.error(f"Voxtral transcription failed: {e}")
+                notify("Voice Module Error", f"Transcription failed: {e}")
+                if self.backend.is_connected():
+                    self.backend.send_status("idle")
+                return
+        else:
+            # ── Backend fallback (legacy faster-whisper) ──
+            log.warning("Voxtral not available — using backend transcription fallback.")
+            log.warning("Install mlx-audio for local transcription: pip install mlx-audio")
+            text = self._transcribe_via_backend(audio_chunks)
+
+        if self.backend.is_connected():
+            self.backend.send_status("idle")
+
+        if text is None:
+            log.error("Transcription failed")
+            notify("Voice Module Error", "Transcription failed")
+            return
+
+        if text:
+            log.info(f'"{text}"')
+            notify("Voice Module", text[:200])
+
+            # Execute the configured action
+            action_name = self.cfg.get("action", "opencode")
+            action = self.runner.get_action(action_name)
+
+            if action is None:
+                log.warning(f"Action '{action_name}' not found on backend. Using fallback clipboard.")
+                self.runner._copy_clipboard(text)
+            else:
+                self.runner.execute(action, text)
+        else:
+            log.info("No speech detected")
+            notify("Voice Module", "No speech detected.")
+
+    def _transcribe_via_backend(self, audio_chunks: list[bytes]) -> str | None:
+        """Fallback: send audio to backend for faster-whisper transcription."""
+        if not self.backend.is_connected():
+            log.error("Backend not connected — cannot transcribe.")
+            return None
+
+        # Send audio as binary chunks
+        with self.backend._lock:
+            ws = self.backend.ws
+        if ws:
+            for chunk in audio_chunks:
+                try:
+                    ws.send(chunk, opcode=websocket.ABNF.OPCODE_BINARY)
+                except Exception as e:
+                    log.error(f"Binary send failed: {e}")
+                    return None
+
+        # Wait for the backend's response (legacy protocol)
+        self.backend.send_message({"type": "stop"})
+        time.sleep(0.5)
+        # NOTE: The new backend protocol does not process binary frames.
+        # This fallback requires the old backend or a backend with whisper support.
+        # For now, log a clear error.
+        log.error("Backend fallback transcription is deprecated.")
+        log.error("The new backend does not process audio. Install mlx-audio for Voxtral.")
+        return None
+
+    def _ensure_auth_token(self):
+        """Fetch auth token from backend on first run and store it locally."""
+        if self.cfg.get("auth_token", "").strip():
+            return  # Already have a token
+
+        log.info("No local auth token — fetching from backend...")
+        try:
+            resp = requests.get(f"{self.cfg['backend_http']}/api/config", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                token = data.get("auth_token", "")
+                if token:
+                    self.cfg["auth_token"] = token
+                    self.runner.auth_token = token
+                    save_config(self.cfg)
+                    log.info("Auth token fetched and stored locally.")
+                    return
+        except requests.RequestException as e:
+            log.warning(f"Could not fetch auth token from backend: {e}")
+
+        log.warning("No auth token available. Action mutations will not be authenticated.")
+
+    # ── run / shutdown ────────────────────────────────────────────────────
+
+    def run(self):
+        # Parse hotkey
+        try:
+            self._mods, self._trigger = parse_hotkey(self.cfg["hotkey"])
+        except ValueError as e:
+            log.error(f"Invalid hotkey: {e}")
+            sys.exit(1)
+
+        mod_names = [str(m).replace("Key.", "") for m in self._mods]
+        trigger_name = str(self._trigger).replace("Key.", "")
+        log.info(f"Hotkey: {'+'.join(mod_names)}+{trigger_name}")
+        log.info(f"Engine: {'Voxtral (local MLX)' if self._use_voxtral else 'Backend fallback'}")
+        log.info(f"Backend: {self.cfg['backend_url']}")
+        log.info(f"Action: {self.cfg.get('action', 'opencode')}")
+        log.info(f"Mic:    {self._mic_name()}")
+
+        # Check backend is running
+        if not self.backend.check_backend():
+            log.warning("Backend is not running!")
+            log.warning("Start it with: docker compose up -d")
+            log.warning(f"Or: cd backend && uvicorn main:app --host 0.0.0.0 --port 8080")
+            ans = input("Continue without backend? Action config will be unavailable. [y/N] ")
+            if ans.lower() != "y":
+                log.info("Exiting. Start the backend and try again.")
+                sys.exit(0)
+
+        # Connect WebSocket
+        if not self.backend.connect():
+            log.error("Failed to connect to backend WebSocket.")
+            ans = input("Continue anyway? [y/N] ")
+            if ans.lower() != "y":
+                sys.exit(1)
+
+        # Fetch auth token from backend (on first run)
+        self._ensure_auth_token()
+
+        # Fetch actions from backend
+        self.runner.fetch_actions()
+        log.info(f"Loaded {len(self.runner._actions)} actions from backend")
+
+        # Signal handlers
+        signal.signal(signal.SIGINT, self._on_signal)
+        signal.signal(signal.SIGTERM, self._on_signal)
+
+        log.info("Voice Module ready. Hold hotkey to record, release to transcribe.")
+        log.info("Press Ctrl+C to stop.\n")
+
+        self._running = True
+        self._listener = pynput_keyboard.Listener(
+            on_press=self._on_press,
+            on_release=self._on_release,
+        )
+        self._listener.daemon = True
+        self._listener.start()
+
+        while self._running and self._listener.is_alive():
+            self._listener.join(timeout=0.5)
+
+        self.shutdown()
+
+    def _on_signal(self, signum, frame):
+        log.info("\nShutting down...")
+        self._running = False
+        # Let the main loop exit cleanly — don't sys.exit() here.
+
+    def shutdown(self):
+        self._running = False
+        if self.recorder.is_recording:
+            self.recorder.stop()
+        if self._listener and self._listener.is_alive():
+            self._listener.stop()
+        log.info("Voice Module client stopped.")
+
+    @staticmethod
+    def _mic_name() -> str:
+        try:
+            dev = sd.query_devices(kind="input")
+            return dev.get("name", "unknown")
+        except Exception:
+            return "unknown"
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Voice Module Client — macOS voice-to-text with Voxtral (Apple MLX)."
+    )
+    parser.add_argument("--hotkey", help="Override hotkey (e.g., cmd+shift+space)")
+    parser.add_argument("--mode", choices=["hold", "toggle"],
+                        help="'hold' (push-to-talk) or 'toggle'")
+    parser.add_argument("--backend", help="WebSocket URL (default: ws://localhost:8080/ws)")
+    parser.add_argument("--backend-http", help="HTTP URL (default: http://localhost:8080)")
+    parser.add_argument("--action", help="Action name to execute on transcription")
+    parser.add_argument("--engine", choices=["voxtral", "backend"],
+                        help="Transcription engine (default: voxtral)")
+    parser.add_argument("--debug", action="store_true", help="Verbose output")
+    parser.add_argument("--list-devices", action="store_true",
+                        help="List audio devices and exit")
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    if args.list_devices:
+        print("Audio input devices:")
+        try:
+            devices = sd.query_devices()
+            for i, d in enumerate(devices):
+                if d["max_input_channels"] > 0:
+                    print(f"  [{i}] {d['name']}")
+        except Exception as e:
+            log.error(f"Could not query audio devices: {e}")
+            sys.exit(1)
+        return
+
+    overrides = {
+        "hotkey": args.hotkey,
+        "mode": args.mode,
+        "backend_url": args.backend,
+        "backend_http": args.backend_http,
+        "action": args.action,
+        "engine": args.engine,
+        "debug": args.debug,
+    }
+    config = load_config({k: v for k, v in overrides.items() if v is not None})
+
+    client = VoiceClient(config)
+    client.run()
+
+
+if __name__ == "__main__":
+    main()

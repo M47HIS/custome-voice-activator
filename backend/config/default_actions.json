@@ -1,0 +1,49 @@
+[
+  {
+    "name": "opencode",
+    "description": "Open Terminal with opencode and paste transcribed text",
+    "type": "terminal_command",
+    "config": {
+      "command": "opencode",
+      "paste_text": true,
+      "new_window": true
+    }
+  },
+  {
+    "name": "clipboard",
+    "description": "Copy transcribed text to clipboard",
+    "type": "clipboard",
+    "config": {}
+  },
+  {
+    "name": "shell",
+    "description": "Run a shell command with the transcribed text",
+    "type": "terminal_command",
+    "config": {
+      "command": "echo \"{text}\"",
+      "paste_text": false
+    }
+  },
+  {
+    "name": "notification",
+    "description": "Show a macOS notification with the transcribed text",
+    "type": "terminal_command",
+    "config": {
+      "command": "osascript -e 'display notification \"{text}\" with title \"Voice Module\"'",
+      "paste_text": false
+    }
+  },
+  {
+    "name": "http_post",
+    "description": "Send transcribed text via HTTP POST to a webhook",
+    "type": "http_request",
+    "config": {
+      "url": "https://example.com/webhook",
+      "method": "POST",
+      "body_template": "{\"text\": \"{text}\"}",
+      "headers": {
+        "Content-Type": "application/json"
+      }
+    }
+  }
+]
