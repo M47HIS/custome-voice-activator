@@ -12,6 +12,10 @@ const STATE = {
     reconnectTimer: null,
     actions: [],
     history: [],
+    settings: { hotkey: "cmd+shift+space", mode: "hold", action: "opencode" },
+    settingsModalVisible: false,
+    recordingShortcut: false,
+    capturedHotkey: null,
     authToken: "",
     editingAction: null,
     waveformAnimId: null,
@@ -300,6 +304,7 @@ async function loadConfig() {
         const resp = await fetch("/api/config");
         const data = await resp.json();
         STATE.authToken = data.auth_token || "";
+        STATE.settings = data.settings || { hotkey: "cmd+shift+space", mode: "hold", action: "opencode" };
         updateEngine(data.engine);
     } catch (e) {
         console.error("Failed to load config:", e);
@@ -559,6 +564,167 @@ function hideModal() {
     $("#modal-overlay").classList.add("hidden");
 }
 
+// ── Settings Modal ──────────────────────────────────────────────────────
+function openSettingsModal() {
+    STATE.settingsModalVisible = true;
+    const currentHotkey = STATE.settings?.hotkey || "cmd+shift+space";
+    $("#settings-current-hotkey").textContent = currentHotkey;
+    resetShortcutRecorder();
+    $("#settings-save-success").classList.add("hidden");
+    $("#settings-modal-overlay").classList.remove("hidden");
+}
+
+function closeSettingsModal() {
+    STATE.settingsModalVisible = false;
+    stopShortcutRecording();
+    $("#settings-modal-overlay").classList.add("hidden");
+}
+
+function startShortcutRecording() {
+    STATE.recordingShortcut = true;
+    STATE.capturedHotkey = null;
+    $("#shortcut-recorder-placeholder").classList.remove("hidden");
+    $("#shortcut-captured").classList.add("hidden");
+    $("#shortcut-error").classList.add("hidden");
+    $("#btn-record-shortcut").disabled = true;
+    $("#btn-save-settings").disabled = true;
+
+    document.addEventListener("keydown", onShortcutKeydown);
+}
+
+function stopShortcutRecording() {
+    STATE.recordingShortcut = false;
+    document.removeEventListener("keydown", onShortcutKeydown);
+    $("#btn-record-shortcut").disabled = false;
+}
+
+function resetShortcutRecorder() {
+    STATE.capturedHotkey = null;
+    $("#shortcut-recorder-placeholder").classList.add("hidden");
+    $("#shortcut-captured").classList.add("hidden");
+    $("#shortcut-error").classList.add("hidden");
+    $("#btn-record-shortcut").disabled = false;
+    $("#btn-save-settings").disabled = true;
+}
+
+function onShortcutKeydown(e) {
+    if (!STATE.recordingShortcut) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+
+    // Escape during recording cancels
+    if (e.key === "Escape") {
+        stopShortcutRecording();
+        resetShortcutRecorder();
+        return;
+    }
+
+    // Collect modifiers
+    const modifiers = [];
+    if (e.metaKey) modifiers.push("cmd");
+    if (e.ctrlKey) modifiers.push("ctrl");
+    if (e.altKey) modifiers.push("alt");
+    if (e.shiftKey) modifiers.push("shift");
+
+    // Ignore pure modifier key presses
+    if (e.key === "Meta" || e.key === "Control" || e.key === "Alt" || e.key === "Shift") {
+        return;
+    }
+
+    // Validate: at least one modifier required
+    if (modifiers.length === 0) {
+        showShortcutError("Shortcut must include at least one modifier (Cmd, Ctrl, Alt, Shift)");
+        return;
+    }
+
+    // Map special keys
+    const specialKeyMap = {
+        " ": "space",
+        "Tab": "tab",
+        "Enter": "enter",
+        "Escape": "esc",
+        "Backspace": "backspace",
+        "Delete": "delete",
+        "ArrowUp": "up",
+        "ArrowDown": "down",
+        "ArrowLeft": "left",
+        "ArrowRight": "right",
+    };
+
+    let key;
+    // F1-F20
+    if (/^F\d+$/.test(e.key)) {
+        key = e.key.toLowerCase();
+    } else if (specialKeyMap[e.key] !== undefined) {
+        key = specialKeyMap[e.key];
+    } else if (e.key.length === 1) {
+        // Single character keys (letters, digits, punctuation)
+        key = e.key.toLowerCase();
+    } else {
+        showShortcutError("Unrecognized key. Try a different combination.");
+        return;
+    }
+
+    // Normalize: modifiers in order cmd, ctrl, alt, shift, key
+    const combo = modifiers.join("+") + "+" + key;
+
+    // Success
+    STATE.capturedHotkey = combo;
+    stopShortcutRecording();
+
+    $("#shortcut-recorder-placeholder").classList.add("hidden");
+    $("#shortcut-captured").textContent = combo;
+    $("#shortcut-captured").classList.remove("hidden");
+    $("#shortcut-error").classList.add("hidden");
+    $("#btn-save-settings").disabled = false;
+}
+
+function showShortcutError(message) {
+    $("#shortcut-error").textContent = message;
+    $("#shortcut-error").classList.remove("hidden");
+}
+
+async function saveSettings() {
+    const hotkey = STATE.capturedHotkey;
+    if (!hotkey) return;
+
+    try {
+        const resp = await fetch("/api/settings", {
+            method: "POST",
+            headers: authHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify({ hotkey }),
+        });
+        if (!resp.ok) {
+            const err = await resp.json();
+            throw new Error(err.detail || "Failed to save settings");
+        }
+        const data = await resp.json();
+        STATE.settings = data;
+
+        // Update displayed current hotkey
+        $("#settings-current-hotkey").textContent = data.hotkey || STATE.capturedHotkey;
+
+        // Reset recorder state
+        resetShortcutRecorder();
+
+        // Show success indicator
+        const successEl = $("#settings-save-success");
+        successEl.classList.remove("hidden");
+        // Re-trigger animation
+        successEl.style.animation = "none";
+        successEl.offsetHeight; // force reflow
+        successEl.style.animation = "fade-out-success 2s ease-out forwards";
+
+        setTimeout(() => {
+            closeSettingsModal();
+        }, 2100);
+    } catch (e) {
+        console.error("Failed to save settings:", e);
+        showShortcutError("Failed to save: " + e.message);
+    }
+}
+
 // ── Utilities ────────────────────────────────────────────────────────────
 function escapeHtml(str) {
     const div = document.createElement("div");
@@ -580,9 +746,16 @@ function bindEvents() {
         updateConfigFields(e.target.value);
     });
 
-    // Keyboard: Escape to close modal
+    // Keyboard: Escape to close modals
     document.addEventListener("keydown", (e) => {
-        if (e.key === "Escape") hideModal();
+        if (e.key === "Escape") {
+            if (STATE.recordingShortcut) return;
+            if (STATE.settingsModalVisible) {
+                closeSettingsModal();
+                return;
+            }
+            hideModal();
+        }
     });
 
     // Delegated event listener for action edit/delete buttons
@@ -601,6 +774,16 @@ function bindEvents() {
             if (name) deleteAction(name);
         }
     });
+
+    // Settings modal
+    $("#btn-settings").addEventListener("click", openSettingsModal);
+    $("#btn-settings-close").addEventListener("click", closeSettingsModal);
+    $("#btn-settings-cancel").addEventListener("click", closeSettingsModal);
+    $("#settings-modal-overlay").addEventListener("click", (e) => {
+        if (e.target === $("#settings-modal-overlay")) closeSettingsModal();
+    });
+    $("#btn-record-shortcut").addEventListener("click", startShortcutRecording);
+    $("#btn-save-settings").addEventListener("click", saveSettings);
 }
 
 // ── Init ─────────────────────────────────────────────────────────────────

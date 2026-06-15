@@ -624,8 +624,9 @@ def notify(title: str, text: str = "") -> None:
 class VoiceClient:
     """macOS client: hotkey → mic → Voxtral transcription → WebSocket → action."""
 
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, cli_overrides: dict | None = None):
         self.cfg = config
+        self._cli_overrides = cli_overrides or {}
         self.recorder = AudioRecorder(sample_rate=config["sample_rate"])
         self.backend = BackendClient(config["backend_url"], config["backend_http"])
         self.runner = ActionRunner(config["backend_http"], auth_token=config.get("auth_token", ""))
@@ -831,17 +832,40 @@ class VoiceClient:
 
     # ── run / shutdown ────────────────────────────────────────────────────
 
-    def run(self):
-        # Parse hotkey
-        try:
-            self._mods, self._trigger = parse_hotkey(self.cfg["hotkey"])
-        except ValueError as e:
-            log.error(f"Invalid hotkey: {e}")
-            sys.exit(1)
+    def _fetch_backend_settings(self):
+        """Fetch settings from backend and merge, respecting CLI overrides.
 
-        mod_names = [str(m).replace("Key.", "") for m in self._mods]
-        trigger_name = str(self._trigger).replace("Key.", "")
-        log.info(f"Hotkey: {'+'.join(mod_names)}+{trigger_name}")
+        Priority: CLI overrides > backend settings > local config file > defaults.
+        """
+        try:
+            resp = requests.get(f"{self.cfg['backend_http']}/api/settings", timeout=5)
+            if resp.status_code == 200:
+                data = resp.json()
+                for key in ("hotkey", "mode", "action"):
+                    if key in data and key not in self._cli_overrides:
+                        old = self.cfg.get(key)
+                        self.cfg[key] = data[key]
+                        log.info(f"[settings] {key}: {old!r} → {data[key]!r} (from backend)")
+                    elif key in data and key in self._cli_overrides:
+                        log.info(
+                            f"[settings] {key}: backend value {data[key]!r} ignored "
+                            f"(CLI override: {self._cli_overrides[key]!r})"
+                        )
+                    elif key not in data:
+                        source = "CLI" if key in self._cli_overrides else "local config"
+                        log.info(
+                            f"[settings] {key}: not in backend response, "
+                            f"using {self.cfg.get(key)!r} (from {source})"
+                        )
+            else:
+                log.warning(f"Backend returned {resp.status_code} for settings")
+        except requests.RequestException as e:
+            log.info(f"Backend settings unavailable — using local config ({e})")
+        except Exception as e:
+            log.warning(f"Unexpected error fetching backend settings: {e}")
+
+    def run(self):
+        log.info(f"Hotkey from config: {self.cfg['hotkey']}")
         log.info(f"Engine: {'Voxtral (local MLX)' if self._use_voxtral else 'Backend fallback'}")
         log.info(f"Backend: {self.cfg['backend_url']}")
         log.info(f"Action: {self.cfg.get('action', 'opencode')}")
@@ -867,9 +891,22 @@ class VoiceClient:
         # Fetch auth token from backend (on first run)
         self._ensure_auth_token()
 
-        # Fetch actions from backend
+        # Fetch actions & settings from backend
         self.runner.fetch_actions()
         log.info(f"Loaded {len(self.runner._actions)} actions from backend")
+        self._fetch_backend_settings()
+
+        # Parse hotkey (after potential backend override)
+        try:
+            self._mods, self._trigger = parse_hotkey(self.cfg["hotkey"])
+        except ValueError as e:
+            log.error(f"Invalid hotkey: {e}")
+            sys.exit(1)
+
+        mod_names = [str(m).replace("Key.", "") for m in self._mods]
+        trigger_name = str(self._trigger).replace("Key.", "")
+        log.info(f"Active hotkey: {'+'.join(mod_names)}+{trigger_name}")
+        log.info(f"Active mode: {self.cfg['mode']}")
 
         # Signal handlers
         signal.signal(signal.SIGINT, self._on_signal)
@@ -956,9 +993,10 @@ def main():
         "engine": args.engine,
         "debug": args.debug,
     }
-    config = load_config({k: v for k, v in overrides.items() if v is not None})
+    cli_overrides = {k: v for k, v in overrides.items() if v is not None}
+    config = load_config(cli_overrides)
 
-    client = VoiceClient(config)
+    client = VoiceClient(config, cli_overrides)
     client.run()
 
 

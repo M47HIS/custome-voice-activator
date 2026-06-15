@@ -6,6 +6,10 @@ This is the legacy standalone module using faster-whisper for transcription.
 For the recommended setup, use client/voice_client.py which uses Voxtral
 (Apple MLX / Apple Neural Engine) for faster, more accurate transcription.
 
+Note: This legacy module does not support backend settings synchronization.
+Use client/voice_client.py for the full-featured client that syncs hotkey,
+mode, and action settings from the Voice Module backend dashboard.
+
 Legacy usage:
     python3 voice_module.py
     python3 voice_module.py --model tiny.en --mode toggle

@@ -32,6 +32,7 @@ LANGUAGE = os.getenv("LANGUAGE", "en")
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config" / "default_actions.json"
 DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).parent / "data")))
 ACTIONS_PATH = DATA_DIR / "actions.json"
+SETTINGS_PATH = DATA_DIR / "settings.json"
 STATIC_DIR = Path(__file__).parent / "static"
 
 # ── App ─────────────────────────────────────────────────────────────────────────
@@ -147,6 +148,8 @@ async def startup():
     _load_or_create_auth_token()
     # Load actions
     load_actions()
+    # Load settings
+    load_settings()
     logger.info("Backend ready.")
 
 
@@ -188,6 +191,40 @@ def save_actions():
         json.dump(_actions, f, indent=2)
 
 
+# ── Settings Management ────────────────────────────────────────────────────────
+
+DEFAULT_SETTINGS: dict = {
+    "hotkey": "cmd+shift+space",
+    "mode": "hold",
+    "action": "opencode",
+}
+_settings: dict = {}
+
+
+def load_settings():
+    global _settings
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    if SETTINGS_PATH.exists():
+        try:
+            with open(SETTINGS_PATH) as f:
+                _settings = json.load(f)
+            logger.info(f"Loaded settings from {SETTINGS_PATH}")
+        except (json.JSONDecodeError, PermissionError) as e:
+            logger.warning(f"Could not parse {SETTINGS_PATH}: {e}")
+            _settings = dict(DEFAULT_SETTINGS)
+    else:
+        _settings = dict(DEFAULT_SETTINGS)
+        save_settings()
+        logger.info(f"Seeded default settings to {SETTINGS_PATH}")
+
+
+def save_settings():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(SETTINGS_PATH, "w") as f:
+        json.dump(_settings, f, indent=2)
+
+
 @app.get("/api/actions")
 async def get_actions():
     return _actions
@@ -221,6 +258,34 @@ async def delete_action(name: str, _token: str = Depends(verify_auth_token)):
     return {"status": "deleted", "name": name}
 
 
+# ── Settings Endpoints ──────────────────────────────────────────────────────────
+
+@app.get("/api/settings")
+async def get_settings():
+    return _settings
+
+
+@app.post("/api/settings")
+async def update_settings(settings: dict, _token: str = Depends(verify_auth_token)):
+    if "hotkey" in settings:
+        if not isinstance(settings["hotkey"], str) or not settings["hotkey"].strip():
+            raise HTTPException(status_code=400, detail="hotkey must be a non-empty string")
+        _settings["hotkey"] = settings["hotkey"].strip()
+
+    if "mode" in settings:
+        if settings["mode"] not in ("hold", "toggle"):
+            raise HTTPException(status_code=400, detail="mode must be 'hold' or 'toggle'")
+        _settings["mode"] = settings["mode"]
+
+    if "action" in settings:
+        if not isinstance(settings["action"], str) or not settings["action"].strip():
+            raise HTTPException(status_code=400, detail="action must be a non-empty string")
+        _settings["action"] = settings["action"].strip()
+
+    save_settings()
+    return _settings
+
+
 @app.get("/api/status")
 async def get_status():
     return JSONResponse({
@@ -240,6 +305,7 @@ async def get_config():
         "language": LANGUAGE,
         "ws_url": "ws://localhost:8080/ws",
         "actions": _actions,
+        "settings": _settings,
         "auth_token": _auth_token,
     })
 

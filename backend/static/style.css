@@ -592,3 +592,116 @@ a:focus-visible {
         grid-template-columns: 1fr;
     }
 }
+
+/* ── Settings ─────────────────────────────────────────────────────── */
+.header-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+/* Settings sections */
+.settings-section {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 0;
+}
+
+.settings-section label {
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--text-secondary);
+    margin: 0;
+}
+
+.settings-value {
+    font-size: 0.9rem;
+    color: var(--text-primary);
+    background: var(--bg-base);
+    padding: 4px 12px;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    user-select: all;
+}
+
+/* Shortcut recorder */
+.shortcut-recorder {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+    background: var(--bg-base);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    margin-top: 4px;
+}
+
+.recording-placeholder {
+    text-align: center;
+    padding: 12px 8px;
+    color: var(--accent);
+    font-size: 0.9rem;
+    animation: pulse-text 1.2s ease-in-out infinite;
+}
+
+.recording-placeholder.hidden {
+    display: none;
+}
+
+@keyframes pulse-text {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.35; }
+}
+
+.shortcut-captured {
+    text-align: center;
+    padding: 12px;
+    font-size: 1.05rem;
+    font-weight: 600;
+    color: var(--state-idle);
+    background: oklch(55% 0.1 145 / 0.1);
+    border-radius: var(--radius-sm);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+}
+
+.shortcut-captured::before {
+    content: "✓";
+    font-size: 0.9rem;
+}
+
+.shortcut-captured.hidden {
+    display: none;
+}
+
+.shortcut-error {
+    text-align: center;
+    padding: 8px;
+    color: var(--state-recording);
+    font-size: 0.85rem;
+    font-weight: 500;
+}
+
+.shortcut-error.hidden {
+    display: none;
+}
+
+.save-success {
+    text-align: center;
+    padding: 8px;
+    color: var(--state-idle);
+    font-size: 0.85rem;
+    font-weight: 600;
+}
+
+.save-success.hidden {
+    display: none;
+}
+
+@keyframes fade-out-success {
+    0%, 60% { opacity: 1; }
+    100% { opacity: 0; }
+}
