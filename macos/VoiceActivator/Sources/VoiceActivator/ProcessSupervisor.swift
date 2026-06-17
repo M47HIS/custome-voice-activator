@@ -159,6 +159,18 @@ final class ProcessSupervisor: ObservableObject {
     private var settingsStore: SettingsStore?
 
     private let backendRunner = BackendRunner.resolve()
+    nonisolated static func resolvedPythonPath() -> String {
+        let candidates = [
+            "/opt/homebrew/opt/python@3.11/libexec/bin/python3",
+            "/opt/homebrew/bin/python3",
+            "/usr/local/bin/python3",
+            "/usr/bin/python3",
+        ]
+        for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
+            return candidate
+        }
+        return "/usr/bin/python3"
+    }
     private let pythonExecutable: String = {
         let candidates = [
             "/opt/homebrew/opt/python@3.11/libexec/bin/python3",
@@ -276,16 +288,15 @@ final class ProcessSupervisor: ObservableObject {
                         let url = self.audioRecorder.stopRecording()
                         LogStore.shared.log("Stopped native audio recording: \(url?.path ?? "nil")")
                         if let url {
-                            LogStore.shared.log("Sent transcribe_file: \(url.path)")
                             self.sendWorkerJSON(["type": "transcribe_file", "path": url.path])
+                            LogStore.shared.log("Sent transcribe_file: \(url.path)")
                         }
                     } else {
-                        self.sendWorkerCommand("toggle_recording")
                         try? self.audioRecorder.startRecording()
                         LogStore.shared.log("Started native audio recording.")
                     }
                 } else {
-                    self.sendWorkerCommand("start_recording")
+                    // hold mode: start recording on press
                     try? self.audioRecorder.startRecording()
                     LogStore.shared.log("Started native audio recording.")
                 }
@@ -295,12 +306,11 @@ final class ProcessSupervisor: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if store.mode == "hold" {
-                    self.sendWorkerCommand("stop_recording")
                     let url = self.audioRecorder.stopRecording()
                     LogStore.shared.log("Stopped native audio recording: \(url?.path ?? "nil")")
                     if let url {
-                        LogStore.shared.log("Sent transcribe_file: \(url.path)")
                         self.sendWorkerJSON(["type": "transcribe_file", "path": url.path])
+                        LogStore.shared.log("Sent transcribe_file: \(url.path)")
                     }
                 }
             }

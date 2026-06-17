@@ -49,8 +49,8 @@ enum AppDiagnostics {
     static func pythonDepsStatus() -> String {
         if let cached = _pythonDepsCache { return cached }
         let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
-        proc.arguments = ["python3", "-c", "import sounddevice, pynput, websocket, requests; print('OK')"]
+        proc.executableURL = URL(fileURLWithPath: ProcessSupervisor.resolvedPythonPath())
+        proc.arguments = ["-c", "import sounddevice, pynput, websocket, requests; print('OK')"]
         let pipe = Pipe()
         proc.standardOutput = pipe
         proc.standardError = pipe

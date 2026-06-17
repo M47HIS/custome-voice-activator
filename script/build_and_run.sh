@@ -86,29 +86,31 @@ check_pid_liveness() {
 }
 
 check_hotkey_log() {
-    if [ ! -f "$LOG_FILE" ]; then
-        echo "[FAIL] Hotkey in log (log file missing: $LOG_FILE)"
+    MARKER_LINE=$(grep -nF "$LAUNCH_MARKER" "$LOG_FILE" | tail -1 | cut -d: -f1)
+    if [ -z "$MARKER_LINE" ]; then
+        echo "[FAIL] Hotkey in log (launch marker not found)"
         return 1
     fi
-    if grep -qF "Registered native hotkey:" "$LOG_FILE" 2>/dev/null; then
+    if tail -n +"$MARKER_LINE" "$LOG_FILE" | grep -qF "Registered native hotkey:"; then
         echo "[PASS] Hotkey in log"
         return 0
     else
-        echo "[FAIL] Hotkey in log (string not found: \"Registered native hotkey:\")"
+        echo "[FAIL] Hotkey in log (string not found since launch: \"Registered native hotkey:\")"
         return 1
     fi
 }
 
 check_worker_ready_log() {
-    if [ ! -f "$LOG_FILE" ]; then
-        echo "[FAIL] Worker ready in log (log file missing: $LOG_FILE)"
+    MARKER_LINE=$(grep -nF "$LAUNCH_MARKER" "$LOG_FILE" | tail -1 | cut -d: -f1)
+    if [ -z "$MARKER_LINE" ]; then
+        echo "[FAIL] Worker ready in log (launch marker not found)"
         return 1
     fi
-    if grep -qF "Worker ready." "$LOG_FILE" 2>/dev/null; then
+    if tail -n +"$MARKER_LINE" "$LOG_FILE" | grep -qF "Worker ready."; then
         echo "[PASS] Worker ready in log"
         return 0
     else
-        echo "[FAIL] Worker ready in log (string not found: \"Worker ready.\")"
+        echo "[FAIL] Worker ready in log (string not found since launch: \"Worker ready.\")"
         return 1
     fi
 }
@@ -140,9 +142,26 @@ if [ "$MODE" = "--verify-installed" ] || [ "$MODE" = "verify-installed" ]; then
     if [ ! -d "$INSTALLED_APP" ]; then
         fail "/Applications/VoiceActivator.app does not exist. Run --install first."
     fi
+    echo "==> Stopping any running instances..."
+    pkill -x "$APP_NAME" 2>/dev/null || true
+    if [ -f "$CLIENT_PID_FILE" ]; then
+        PID=$(tr -d '[:space:]' < "$CLIENT_PID_FILE")
+        kill "$PID" 2>/dev/null || true
+        rm -f "$CLIENT_PID_FILE"
+    fi
+    sleep 1
+    LAUNCH_MARKER="=== VERIFY $(date +%s) ==="
+    echo "$LAUNCH_MARKER" >> "$LOG_FILE"
     echo "==> Launching installed $INSTALLED_APP..."
     VOICE_MODULE_REPO="$ROOT_DIR" /usr/bin/open -n "$INSTALLED_APP"
     sleep 8
+    check_process_count
+    APP_PID=$(pgrep -x "VoiceActivator" | head -1)
+    APP_PATH=$(ps -o comm= -p "$APP_PID" 2>/dev/null || echo "")
+    case "$APP_PATH" in
+        /Applications/VoiceActivator.app/*) ;;
+        *) fail "VoiceActivator path is $APP_PATH, expected /Applications/VoiceActivator.app/*" ;;
+    esac
     run_checks
     exit 0
 fi
@@ -231,6 +250,8 @@ case "$MODE" in
         /usr/bin/log stream --info --style compact --predicate "subsystem == \"$BUNDLE_ID\""
         ;;
     --verify|verify)
+        LAUNCH_MARKER="=== VERIFY $(date +%s) ==="
+        echo "$LAUNCH_MARKER" >> "$LOG_FILE"
         open_app
         sleep 8
         run_checks
