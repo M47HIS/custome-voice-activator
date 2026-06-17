@@ -273,6 +273,10 @@ final class ProcessSupervisor: ObservableObject {
                     if self.audioRecorder.isRecording {
                         let url = self.audioRecorder.stopRecording()
                         LogStore.shared.log("Stopped native audio recording: \(url?.path ?? "nil")")
+                        if let url {
+                            LogStore.shared.log("Sent transcribe_file: \(url.path)")
+                            self.sendWorkerJSON(["type": "transcribe_file", "path": url.path])
+                        }
                     } else {
                         self.sendWorkerCommand("toggle_recording")
                         try? self.audioRecorder.startRecording()
@@ -292,6 +296,10 @@ final class ProcessSupervisor: ObservableObject {
                     self.sendWorkerCommand("stop_recording")
                     let url = self.audioRecorder.stopRecording()
                     LogStore.shared.log("Stopped native audio recording: \(url?.path ?? "nil")")
+                    if let url {
+                        LogStore.shared.log("Sent transcribe_file: \(url.path)")
+                        self.sendWorkerJSON(["type": "transcribe_file", "path": url.path])
+                    }
                 }
             }
         }
@@ -555,6 +563,21 @@ final class ProcessSupervisor: ObservableObject {
             try handle.write(contentsOf: data)
         } catch {
             LogStore.shared.error("Could not send worker command \(type): \(error.localizedDescription)")
+        }
+    }
+
+    private func sendWorkerJSON(_ dict: [String: Any]) {
+        guard JSONSerialization.isValidJSONObject(dict),
+              var data = try? JSONSerialization.data(withJSONObject: dict),
+              let handle = workerInput?.fileHandleForWriting else {
+            LogStore.shared.warn("Worker JSON command ignored; worker input is unavailable.")
+            return
+        }
+        data.append(0x0A) // newline terminator
+        do {
+            try handle.write(contentsOf: data)
+        } catch {
+            LogStore.shared.error("Could not send worker JSON: \(error.localizedDescription)")
         }
     }
 

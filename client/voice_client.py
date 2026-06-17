@@ -1000,6 +1000,10 @@ class VoiceClient:
                     self._start_recording()
             elif command == "shutdown":
                 self._running = False
+            elif command == "transcribe_file":
+                path = message.get("path", "")
+                log.info(f"Received transcribe_file: {path}")
+                self._handle_transcribe_file(path)
             else:
                 self._emit_worker_event({"type": "error", "message": f"Unknown command: {command}"})
 
@@ -1009,6 +1013,97 @@ class VoiceClient:
         if not self._worker_mode:
             return
         print(json.dumps(event, ensure_ascii=False), flush=True)
+
+    def _handle_transcribe_file(self, path: str) -> None:
+        """Transcribe a WAV file recorded by the Swift audio recorder."""
+        if not path or not os.path.exists(path):
+            log.error(f"File not found: {path}")
+            self._emit_worker_event({"type": "error", "message": f"File not found: {path}"})
+            return
+
+        try:
+            with wave.open(path, "rb") as wf:
+                nchannels = wf.getnchannels()
+                sampwidth = wf.getsampwidth()
+                framerate = wf.getframerate()
+                raw_bytes = wf.readframes(wf.getnframes())
+            log.info(
+                f"WAV: {nchannels}ch, {sampwidth * 8}-bit, "
+                f"{framerate}Hz, {len(raw_bytes)} bytes"
+            )
+        except Exception as e:
+            log.error(f"Failed to read WAV file: {e}")
+            self._emit_worker_event({"type": "error", "message": f"Failed to read WAV: {e}"})
+            return
+
+        duration = len(raw_bytes) / (sampwidth * max(framerate, 1) * max(nchannels, 1))
+        if duration < self.cfg["min_duration"]:
+            log.info(f"Recording too short ({duration:.1f}s) — skipped.")
+            self._emit_worker_event({"type": "status", "state": "idle"})
+            self._cleanup_wav(path)
+            return
+
+        log.info(f"Duration: {duration:.1f}s, transcribing...")
+        self._emit_worker_event({"type": "status", "state": "transcribing"})
+
+        text: str | None = None
+        if self._use_voxtral:
+            try:
+                if self._transcriber is None:
+                    self._transcriber = VoxtralTranscriber(
+                        sample_rate=self.cfg["sample_rate"]
+                    )
+                text = self._transcriber.transcribe(raw_bytes, language=self.cfg["language"])
+            except Exception as e:
+                log.error(f"Transcription failed: {e}")
+                self._emit_worker_event({"type": "error", "message": f"Transcription failed: {e}"})
+                self._emit_worker_event({"type": "status", "state": "idle"})
+                self._cleanup_wav(path)
+                return
+        else:
+            log.error("Voxtral not available")
+            self._emit_worker_event({"type": "error", "message": "Voxtral not available"})
+            self._emit_worker_event({"type": "status", "state": "idle"})
+            self._cleanup_wav(path)
+            return
+
+        self._emit_worker_event({"type": "status", "state": "idle"})
+
+        if text is None:
+            self._emit_worker_event({"type": "error", "message": "Transcription failed"})
+            self._cleanup_wav(path)
+            return
+
+        if text:
+            log.info(f'"{text}"')
+            self._emit_worker_event({"type": "transcribed", "text": text})
+
+            action_name = self.cfg.get("action", "opencode")
+            action = self.runner.get_action(action_name)
+            if action is None:
+                log.warning(
+                    f"Action '{action_name}' not found. Using fallback clipboard."
+                )
+                ok = self.runner._copy_clipboard(text)
+            else:
+                ok = self.runner.execute(action, text)
+            self._emit_worker_event(
+                {"type": "action_done", "action": action_name, "ok": bool(ok)}
+            )
+        else:
+            log.info("No speech detected")
+            self._emit_worker_event({"type": "transcribed", "text": ""})
+
+        self._cleanup_wav(path)
+        log.info("transcribe_file complete")
+
+    @staticmethod
+    def _cleanup_wav(path: str) -> None:
+        try:
+            os.remove(path)
+            log.info(f"Cleaned up temp WAV: {path}")
+        except OSError:
+            pass
 
     def _on_signal(self, signum, frame):
         log.info("\nShutting down...")
