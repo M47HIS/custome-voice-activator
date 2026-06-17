@@ -151,6 +151,8 @@ final class ProcessSupervisor: ObservableObject {
     @Published private(set) var menuState: MenuState = .offline
     @Published private(set) var statusIconName: String = "waveform.circle"
     @Published private(set) var repoRoot: URL? = nil
+    @Published var hotkeyRegistered: Bool = false
+    @Published var workerReady: Bool = false
 
     // Wiring
     private var backendClient: BackendClient?
@@ -304,6 +306,7 @@ final class ProcessSupervisor: ObservableObject {
             }
         }
         try hotkeyManager.register(hotkey)
+        hotkeyRegistered = true
         LogStore.shared.log("Registered native hotkey: \(store.hotkey) mode=\(store.mode)")
     }
 
@@ -605,6 +608,7 @@ final class ProcessSupervisor: ObservableObject {
         switch type {
         case "ready":
             client = .running
+            workerReady = true
             LogStore.shared.log("Worker ready.")
         case "status":
             let state = json["state"] as? String ?? "idle"

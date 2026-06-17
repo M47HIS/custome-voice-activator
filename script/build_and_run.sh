@@ -240,7 +240,12 @@ case "$MODE" in
         echo "==> Installing $APP_BUNDLE to $INSTALL_TARGET..."
         rm -rf "$INSTALL_TARGET"
         cp -R "$APP_BUNDLE" "$INSTALL_TARGET"
-        echo "Installed $INSTALL_TARGET"
+        echo "==> Ad-hoc signing $INSTALL_TARGET..."
+        codesign --force --deep --sign - "$INSTALL_TARGET" || {
+            echo "ERROR: codesign failed. Check command-line tools." >&2
+            exit 1
+        }
+        echo "Installed and signed $INSTALL_TARGET"
         ;;
     *)
         usage

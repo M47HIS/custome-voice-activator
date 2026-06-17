@@ -65,6 +65,7 @@ struct SettingsView: View {
     @State private var loadError: String? = nil
     @State private var notificationStatus: String = "checking"
     @State private var launchAtLoginStatus: String = "checking"
+    @State private var refreshToggle: Bool = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -82,6 +83,23 @@ struct SettingsView: View {
             }
 
             Form {
+                Section("Readiness") {
+                    HStack {
+                        Button("Refresh") {
+                            AppDiagnostics.invalidatePythonDepsCache()
+                            // Force re-evaluation of all readiness checks
+                            refreshToggle.toggle()
+                        }
+                        .buttonStyle(.bordered)
+                        Spacer()
+                    }
+                    ReadinessRow(label: "Hotkey registered", ok: supervisor.hotkeyRegistered)
+                    ReadinessRow(label: "Microphone", ok: AppDiagnostics.microphoneStatus == "granted")
+                    ReadinessRow(label: "Backend healthy", ok: supervisor.backend == .running)
+                    ReadinessRow(label: "Worker ready", ok: supervisor.workerReady)
+                    ReadinessRow(label: "Python deps", ok: AppDiagnostics.pythonDepsStatus() == "OK")
+                }
+
                 Section("Hotkey") {
                     HStack(alignment: .center, spacing: 12) {
                         KeyCaptureView(
@@ -298,5 +316,24 @@ struct SettingsView: View {
         if let b = state as? BackendProcessState { return b.shortLabel }
         if let c = state as? ClientProcessState { return c.shortLabel }
         return "unknown"
+    }
+}
+
+// MARK: - Readiness Row
+
+private struct ReadinessRow: View {
+    let label: String
+    let ok: Bool
+
+    var body: some View {
+        LabeledContent(label) {
+            HStack(spacing: 4) {
+                Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
+                    .foregroundColor(ok ? .green : .red)
+                Text(ok ? "Ready" : "Missing")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
     }
 }

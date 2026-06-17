@@ -38,6 +38,40 @@ enum AppDiagnostics {
         openSettings("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
     }
 
+    static func openInputMonitoringSettings() {
+        openSettings("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
+    }
+
+    // MARK: - Python deps check
+
+    private static var _pythonDepsCache: String? = nil
+
+    static func pythonDepsStatus() -> String {
+        if let cached = _pythonDepsCache { return cached }
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/env")
+        proc.arguments = ["python3", "-c", "import sounddevice, pynput, websocket, requests; print('OK')"]
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch {
+            _pythonDepsCache = "Error: \(error.localizedDescription)"
+            return _pythonDepsCache!
+        }
+        let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
+        let output = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let result = (proc.terminationStatus == 0 && output.contains("OK")) ? "OK" : "Missing"
+        _pythonDepsCache = result
+        return result
+    }
+
+    static func invalidatePythonDepsCache() {
+        _pythonDepsCache = nil
+    }
+
     @available(macOS 13.0, *)
     static var launchAtLoginStatus: String {
         switch SMAppService.mainApp.status {
