@@ -31,18 +31,18 @@ All processing happens on your machine. No audio leaves your Mac.
 │  │ VoiceActivator.app       │ ◄───────────────────► │  Backend       │ │
 │  │ (Swift menu-bar app)     │    settings, status   │  (OrbStack)    │ │
 │  │                          │                       │                │ │
-│  │ • ProcessSupervisor      │                       │  FastAPI:8080  │ │
-│  │ • BackendClient          │                       │  Actions       │ │
-│  │ • Settings window        │                       │  History       │ │
-│  │ • Native hotkey manager  │                       │  (no UI)       │ │
-│  └──────────────┬───────────┘                       └───────▲────────┘ │
-│                 │ spawns                                        │       │
-│                 ▼                                               │       │
-│  ┌──────────────────────────┐                       ┌──────────┴─────┐ │
+│  │ • Hotkey manager         │                       │  FastAPI:8080  │ │
+│  │ • Audio recorder (mic)   │                       │  Actions       │ │
+│  │ • ProcessSupervisor      │                       │  History       │ │
+│  │ • BackendClient          │                       │  (no UI)       │ │
+│  │ • Settings window        │                       └───────▲────────┘ │
+│  └──────────────┬───────────┘                               │       │
+│                 │ spawns, sends file paths                   │       │
+│                 ▼                                            │       │
+│  ┌──────────────────────────┐                       ┌────────┴──────┐ │
 │  │  voice_client.py         │ ◄──── WebSocket ─────►│   Backend     │ │
 │  │  (Python worker)         │   status / actions    │                │ │
 │  │                          │                       │                │ │
-│  │  • sounddevice (mic)     │                       │                │ │
 │  │  • Voxtral (Apple MLX)   │                       │                │ │
 │  │  • Action runner         │                       │                │ │
 │  └──────────────────────────┘                       └────────────────┘ │
@@ -51,9 +51,9 @@ All processing happens on your machine. No audio leaves your Mac.
 
 **Three components, one Mac:**
 
-1. **VoiceActivator** — Swift menu-bar app. Primary UI. Manages the lifecycle of the other two.
+1. **VoiceActivator** — Swift menu-bar app. Primary UI. Owns the global hotkey, microphone capture, and raw audio recording. Spawns the Python worker and sends audio file paths for transcription.
 2. **Backend** — FastAPI in Docker, bound to `127.0.0.1:8080`. Headless coordination: actions, settings, transcription history, status relay.
-3. **Python worker** — `client/voice_client.py --worker`. Mic + Voxtral transcription + action execution. Speaks to the backend over WebSocket and receives recording commands from the Swift app.
+3. **Python worker** — `client/voice_client.py --worker`. Receives audio file paths from the Swift app, runs Voxtral transcription, executes actions. Speaks to the backend over WebSocket for status and action configuration.
 
 ---
 
@@ -70,10 +70,10 @@ All processing happens on your machine. No audio leaves your Mac.
 - **Xcode 15+** (or the Swift toolchain) — needed to build the menu-bar app
 - [Homebrew](https://brew.sh) (recommended)
 
-### 2. Install client dependencies
+### 2. Install dependencies
 
 ```bash
-# System dependency for audio
+# System dependency for audio (Python worker uses sounddevice)
 brew install portaudio
 
 # Python packages
@@ -84,28 +84,46 @@ pip3 install -r requirements.txt
 pip3 install mlx-audio
 ```
 
-### 3. Build the menu-bar app
+### 3. Build and install
 
 ```bash
-./script/build_and_run.sh
+# Build the Swift app, stage it to dist/, and install to /Applications
+./script/build_and_run.sh --install
 ```
 
-This builds the Swift app in release mode, stages `dist/VoiceActivator.app`,
-and launches it. You should see a waveform icon appear in the menu bar.
+This builds the Swift app in release mode, copies it to `/Applications/VoiceActivator.app`, and ad-hoc signs it.
 
-The app **auto-starts the backend (Docker) and the Python worker** on first
-launch. Click the menu-bar icon to access Settings, view status, or open logs.
+### 4. Launch and grant permissions
 
-### 4. Grant macOS Permissions
+Open the installed app:
 
-VoiceActivator owns the global hotkey. The Python worker owns audio capture
-and transcription. See [Permissions Setup](#permissions-setup).
+```bash
+open /Applications/VoiceActivator.app
+```
+
+VoiceActivator needs:
+- **Accessibility** — for the global hotkey (and paste/automation actions)
+- **Microphone** — for native audio capture
+
+macOS prompts on first use. If denied, grant via:
+**System Settings → Privacy & Security → Accessibility** and **→ Microphone**.
+
+The app auto-starts the backend (Docker) and the Python worker on launch.
+Click the menu-bar icon to access Settings, view status, or open logs.
 
 ### 5. Hold the hotkey
 
 Default hotkey: **Cmd+Shift+Space** (hold to record, release to transcribe).
 
 > First run downloads the Voxtral model (~2GB, cached in `~/.cache/huggingface/`).
+
+### Happy path
+
+1. `pip3 install -r client/requirements.txt && pip3 install mlx-audio`
+2. `./script/build_and_run.sh --install`
+3. Open the app, grant Accessibility and Microphone when prompted
+4. Press **Cmd+Shift+Space**, speak, release
+5. Transcription lands in the selected action (default: opencode)
 
 ---
 
@@ -125,13 +143,14 @@ The menu-bar icon shows the current state:
 
 - **Status** — backend and client health dots
 - **Start / Stop / Restart** — manage both processes
-- **Settings…** — hotkey recorder (NSEvent-based), mode (hold/toggle), action dropdown
+- **Settings…** — hotkey recorder (NSEvent-based), mode (hold/toggle), action dropdown, readiness panel
 - **Open Logs** — Finder at `~/Library/Logs/VoiceModule/`
 - **Open Config Folder** — Finder at `~/.config/voice-module/`
 - **Quit**
 
 ### Settings window
 
+- **Readiness** — checkmarks for hotkey, microphone, backend, worker, and Python deps. Quick links to System Settings for Accessibility, Microphone, and Input Monitoring.
 - **Hotkey recorder** — Click the field, press a key combination. Requires at least one modifier (Cmd/Ctrl/Alt/Shift). The captured combo is serialized to the same format (`cmd+ctrl+alt+shift+key`) that the Python parser accepts.
 - **Mode** — Hold (push-to-talk) or Toggle (press to start, press again to stop).
 - **Action** — dropdown populated from the backend's `/api/actions` endpoint.
@@ -175,6 +194,13 @@ Actions define what happens with transcribed text. Manage them via:
 - **notification** — Show macOS notification with transcribed text
 - **http_post** — Send to a webhook (configure your URL)
 
+### Native audio recording
+
+The Swift app captures raw microphone audio directly via `AVAudioEngine`.
+When the hotkey is pressed (hold mode) or toggled on, recording starts.
+On release or toggle-off, the `.wav` file path is sent to the Python worker
+for transcription. The worker never touches the microphone.
+
 ### ProcessSupervisor
 
 The Swift app's `ProcessSupervisor` is the single source of truth for process
@@ -183,6 +209,8 @@ lifecycle. It:
 - Resolves OrbStack (`orb`) or Docker (`docker`) at launch — prefers OrbStack.
 - Runs `docker compose up -d --build` on first start, polls `/api/status` until healthy.
 - Spawns `python3 client/voice_client.py` as a subprocess, captures stdout/stderr to `~/.local/log/voice-module/`.
+- Sends JSON commands and audio file paths to the worker over stdin.
+- Reads worker events (ready, status, transcribed, error) from stdout.
 - Stops the backend with `docker compose stop voice-backend` (preserves the container) and restarts with `docker compose restart`.
 - Sends SIGTERM to the client, then SIGKILL after a 1.5s grace period.
 - Auto-reconnects the WebSocket and re-fetches settings/actions on launch.
@@ -213,10 +241,10 @@ in Console.app under subsystem `com.voicemodule.activator`).
 }
 ```
 
-The Swift app mirrors its **own** config (hotkey, mode, action) via the
-backend at `127.0.0.1:8080/api/settings`. The Python worker reads action and
-engine settings on startup; the Swift app owns the global hotkey and sends
-recording commands to the worker.
+The Swift app stores hotkey, mode, and action via the backend at
+`127.0.0.1:8080/api/settings`. The Python worker reads action and engine
+settings on startup. The Swift app owns the hotkey, microphone, and recording;
+the worker handles transcription and actions.
 
 ### Hotkey Format
 
@@ -244,10 +272,14 @@ LANGUAGE=en
 ### Menu-bar app (Swift)
 
 ```bash
-./script/build_and_run.sh          # build + launch dist/VoiceActivator.app
-./script/build_and_run.sh --verify # build + launch + process check
-./script/build_and_run.sh --install # copy dist/VoiceActivator.app to /Applications
-pkill -x VoiceActivator            # stop
+./script/build_and_run.sh                 # build + launch dist/VoiceActivator.app
+./script/build_and_run.sh --verify        # build + launch + 6 process/health checks
+./script/build_and_run.sh --verify-installed  # launch /Applications copy + health checks
+./script/build_and_run.sh --install       # build + copy to /Applications + ad-hoc sign
+./script/build_and_run.sh --debug         # launch under lldb
+./script/build_and_run.sh --logs          # launch + stream system logs
+./script/build_and_run.sh --telemetry     # launch + stream subsystem logs
+pkill -x VoiceActivator                   # stop
 ```
 
 ### Client (Python, used internally)
@@ -323,33 +355,56 @@ python3 voice_module.py --model tiny.en --mode toggle
 
 ## Permissions Setup
 
-### Accessibility
+VoiceActivator.app owns all permissions. The Python worker does not need
+microphone, accessibility, or input monitoring — it only receives audio
+file paths from the Swift app.
 
-VoiceActivator uses a native macOS hotkey registration path. If hotkeys or
-paste/automation actions are blocked, grant Accessibility to the installed app.
+| Permission | App | Purpose | System Settings |
+|------------|-----|---------|-----------------|
+| Accessibility | VoiceActivator.app | Global hotkey, paste/automation actions | Privacy & Security → Accessibility |
+| Microphone | VoiceActivator.app | Native audio capture | Privacy & Security → Microphone |
+| Input Monitoring | VoiceActivator.app | Alternative hotkey path (if needed) | Privacy & Security → Input Monitoring |
+| Notifications | VoiceActivator.app | "Recording…" / "Transcribed: …" banners | Notifications |
+
+### Accessibility
 
 1. **System Settings → Privacy & Security → Accessibility**
 2. Click **+** and add `VoiceActivator.app`
 3. Toggle must be **ON**
 
-> Legacy/manual Python mode still uses `pynput`. If you run Python directly,
-> you may need to add the Python binary:
-> `/opt/homebrew/opt/python@3.11/libexec/bin/python3`
-
-### Microphone (required)
+### Microphone
 
 The first time you trigger a recording, macOS prompts for permission.
-If it doesn't:
+If denied:
 
 1. **System Settings → Privacy & Security → Microphone**
-2. Enable the Python process used by the worker. If you install/run the app
-   bundle directly, also enable `VoiceActivator.app` if macOS lists it.
+2. Enable `VoiceActivator.app`
+
+> The Python worker does **not** use the microphone — audio is captured natively
+> by VoiceActivator.app and passed to the worker as `.wav` file paths.
 
 ### Notifications (optional)
 
 For the optional "Recording..." / "Transcribed: ..." banners. Grant
-`VoiceActivator.app` or the Python worker in **System Settings → Notifications**
-if macOS prompts.
+`VoiceActivator.app` in **System Settings → Notifications** if macOS prompts.
+
+---
+
+## Launch at Login
+
+The Settings window includes a **Launch at login** control using macOS
+`SMAppService`. If macOS reports "requires approval", approve VoiceActivator in
+**System Settings → General → Login Items**.
+
+```bash
+# Install the app first
+./script/build_and_run.sh --install
+
+# Then enable Launch at Login from the Settings window, or launch manually:
+open /Applications/VoiceActivator.app
+```
+
+The menu-bar app will start the backend and Python worker automatically.
 
 ---
 
@@ -362,8 +417,9 @@ if macOS prompts.
 ls macos/VoiceActivator/.build/release/VoiceActivator
 
 # Run with logs visible
-macos/VoiceActivator/.build/release/VoiceActivator
-# or
+./script/build_and_run.sh --logs
+
+# Or tail the log directly
 tail -f ~/Library/Logs/VoiceModule/menu-bar.log
 ```
 
@@ -383,15 +439,15 @@ docker compose up -d
 
 ### "Hotkey not working"
 
-- Verify Accessibility permissions (see above)
+- Verify Accessibility permissions for **VoiceActivator.app** (see [Permissions Setup](#permissions-setup))
 - Check no other app is using the same hotkey
-- Run with `python3 client/voice_client.py --debug` to see key events
+- Run with `python3 client/voice_client.py --debug` to see key events (legacy mode)
 
 ### "No audio / recording too short"
 
-- Check Microphone permissions
-- Verify your mic: `python3 client/voice_client.py --list-devices`
-- If no default mic, set one in **System Settings → Sound → Input**
+- Check Microphone permissions for **VoiceActivator.app** (not the Python worker)
+- Verify your mic works: **System Settings → Sound → Input**
+- Check the Swift app logs at `~/Library/Logs/VoiceModule/menu-bar.log`
 
 ### "Voxtral model download failed"
 
@@ -441,27 +497,13 @@ python3 voice_client.py --debug
 |---------|-------------------------------|--------------------------------|
 | UI | Native macOS menu bar (waveform icon) | Terminal only |
 | Setup | Build Swift app + Docker | `pip install` only |
-| Transcription | Voxtral on client (Apple MLX) | Local faster-whisper |
-| RAM usage | Backend ~50MB, Voxtral in client | Model in main process |
+| Audio capture | Native (AVAudioEngine) | Python (sounddevice) |
+| Transcription | Voxtral on worker (Apple MLX) | Local faster-whisper |
+| RAM usage | Backend ~50MB, Voxtral in worker | Model in main process |
 | Settings UI | Native window (hotkey recorder, mode, action) | Config file only |
 | Action config | Live from backend (`/api/actions`) | Hardcoded to opencode |
 | Multi-client | Yes (any client on network) | No |
 | Best for | Daily use, multi-action, configurable | Quick single-user, no Docker |
-
----
-
-## Optional: Install and Launch at Login
-
-```bash
-./script/build_and_run.sh --install
-open /Applications/VoiceActivator.app
-```
-
-The Settings window includes a **Launch at login** control using macOS
-`SMAppService`. If macOS reports "requires approval", approve VoiceActivator in
-**System Settings → General → Login Items**.
-
-The menu-bar app will start the backend and Python worker automatically.
 
 ---
 
