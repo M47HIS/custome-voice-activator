@@ -3,9 +3,11 @@
 **macOS always-on voice-to-text hotkey trigger with Voxtral transcription.**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![macOS](https://img.shields.io/badge/macOS-13%2B-000000?logo=apple)](https://www.apple.com/macos/)
 [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python)](https://python.org)
 [![Voxtral](https://img.shields.io/badge/Powered_by-Voxtral-FF6B35?logo=apple)](https://huggingface.co/mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit)
-[![FastAPI](https://img.shields.io/badge/FastAPI-✔-009688?logo=fastapi)](https://fastapi.tiangolo.com)
+[![FastAPI](https://img.shields.io/badge/Backend-FastAPI-009688?logo=fastapi)](https://fastapi.tiangolo.com)
+[![Swift](https://img.shields.io/badge/UI-SwiftUI-F05138?logo=swift)](https://developer.apple.com/swiftui/)
 
 Hold a hotkey, speak, release — and your speech is transcribed locally via
 **[Voxtral](https://huggingface.co/mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit)**
@@ -14,29 +16,44 @@ with `opencode`, copy to clipboard, trigger a webhook, or run any command.
 
 All processing happens on your machine. No audio leaves your Mac.
 
+> **Primary UI: a native macOS menu-bar app.** The web dashboard has been
+> removed from the product surface. The backend is a headless local API.
+
 ---
 
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────────┐
-│                         macOS                                 │
-│                                                               │
-│  ┌──────────────────────┐        WebSocket       ┌──────────────────────┐
-│  │  Client               │ ◄───────────────────► │  Backend (OrbStack)   │
-│  │                       │   status/transcription│                      │
-│  │  pynput (hotkeys)     │                       │  FastAPI :8080        │
-│  │  sounddevice (mic)    │   ◄── actions ──►     │  Actions + History    │
-│  │  Voxtral (Apple MLX)  │                       │  Web UI dashboard     │
-│  │  Action runner        │                       │                      │
-│  └──────────────────────┘                       └──────────────────────┘
-│                                                               │
-│  Transcribe locally → Send result → Execute action            │
-└───────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│                              macOS                                    │
+│                                                                      │
+│  ┌──────────────────────────┐    REST + WebSocket   ┌────────────────┐ │
+│  │ VoiceActivator.app       │ ◄───────────────────► │  Backend       │ │
+│  │ (Swift menu-bar app)     │    settings, status   │  (OrbStack)    │ │
+│  │                          │                       │                │ │
+│  │ • ProcessSupervisor      │                       │  FastAPI:8080  │ │
+│  │ • BackendClient          │                       │  Actions       │ │
+│  │ • Settings window        │                       │  History       │ │
+│  │ • Native hotkey manager  │                       │  (no UI)       │ │
+│  └──────────────┬───────────┘                       └───────▲────────┘ │
+│                 │ spawns                                        │       │
+│                 ▼                                               │       │
+│  ┌──────────────────────────┐                       ┌──────────┴─────┐ │
+│  │  voice_client.py         │ ◄──── WebSocket ─────►│   Backend     │ │
+│  │  (Python worker)         │   status / actions    │                │ │
+│  │                          │                       │                │ │
+│  │  • sounddevice (mic)     │                       │                │ │
+│  │  • Voxtral (Apple MLX)   │                       │                │ │
+│  │  • Action runner         │                       │                │ │
+│  └──────────────────────────┘                       └────────────────┘ │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
-**Voxtral runs on the Mac client** (Apple Neural Engine), not in Docker.
-The backend is lightweight — just coordination, actions, and the web dashboard.
+**Three components, one Mac:**
+
+1. **VoiceActivator** — Swift menu-bar app. Primary UI. Manages the lifecycle of the other two.
+2. **Backend** — FastAPI in Docker, bound to `127.0.0.1:8080`. Headless coordination: actions, settings, transcription history, status relay.
+3. **Python worker** — `client/voice_client.py --worker`. Mic + Voxtral transcription + action execution. Speaks to the backend over WebSocket and receives recording commands from the Swift app.
 
 ---
 
@@ -44,24 +61,16 @@ The backend is lightweight — just coordination, actions, and the web dashboard
 
 ### 1. Prerequisites
 
-- **macOS** (for the native client + Apple Neural Engine)
+- **macOS 13+** (for the menu-bar app)
 - **OrbStack** (or Docker Desktop) installed and running
   ```bash
   brew install orbstack
   ```
 - **Python 3.11+** with pip
+- **Xcode 15+** (or the Swift toolchain) — needed to build the menu-bar app
 - [Homebrew](https://brew.sh) (recommended)
 
-### 2. Start the Backend
-
-```bash
-docker compose up -d
-```
-
-The backend starts almost instantly (no model download needed).
-Open **http://localhost:8080** to see the web dashboard.
-
-### 3. Install Client Dependencies
+### 2. Install client dependencies
 
 ```bash
 # System dependency for audio
@@ -75,20 +84,62 @@ pip3 install -r requirements.txt
 pip3 install mlx-audio
 ```
 
-### 4. Grant macOS Permissions
-
-The client needs **Accessibility** (for global hotkeys) and **Microphone**
-access. See [Permissions Setup](#permissions-setup) below.
-
-### 5. Start the Client
+### 3. Build the menu-bar app
 
 ```bash
-python3 client/voice_client.py
+./script/build_and_run.sh
 ```
 
-Hold **Cmd+Shift+Space**, speak, release → transcription + action!
+This builds the Swift app in release mode, stages `dist/VoiceActivator.app`,
+and launches it. You should see a waveform icon appear in the menu bar.
+
+The app **auto-starts the backend (Docker) and the Python worker** on first
+launch. Click the menu-bar icon to access Settings, view status, or open logs.
+
+### 4. Grant macOS Permissions
+
+VoiceActivator owns the global hotkey. The Python worker owns audio capture
+and transcription. See [Permissions Setup](#permissions-setup).
+
+### 5. Hold the hotkey
+
+Default hotkey: **Cmd+Shift+Space** (hold to record, release to transcribe).
 
 > First run downloads the Voxtral model (~2GB, cached in `~/.cache/huggingface/`).
+
+---
+
+## The Menu-Bar App
+
+The menu-bar icon shows the current state:
+
+| Icon | State |
+|------|-------|
+| `waveform.circle` | Idle (default) |
+| `waveform.circle.fill` | Listening (recording) |
+| `waveform.path.ecg` | Transcribing |
+| `exclamationmark.triangle.fill` | Error |
+| `xmark.circle.fill` | Offline (backend not running) |
+
+**Click the icon** to open a menu with:
+
+- **Status** — backend and client health dots
+- **Start / Stop / Restart** — manage both processes
+- **Settings…** — hotkey recorder (NSEvent-based), mode (hold/toggle), action dropdown
+- **Open Logs** — Finder at `~/Library/Logs/VoiceModule/`
+- **Open Config Folder** — Finder at `~/.config/voice-module/`
+- **Quit**
+
+### Settings window
+
+- **Hotkey recorder** — Click the field, press a key combination. Requires at least one modifier (Cmd/Ctrl/Alt/Shift). The captured combo is serialized to the same format (`cmd+ctrl+alt+shift+key`) that the Python parser accepts.
+- **Mode** — Hold (push-to-talk) or Toggle (press to start, press again to stop).
+- **Action** — dropdown populated from the backend's `/api/actions` endpoint.
+- **Status** — read-only display of backend and client states.
+- **Permissions** — Accessibility, Microphone, Notifications, and quick links to System Settings.
+- **Logs** — read-only path display + "Reveal in Finder" button.
+
+Saving posts to `POST /api/settings` with a Bearer token.
 
 ---
 
@@ -104,8 +155,8 @@ no API keys. Fast, private, and always available.
 
 Actions define what happens with transcribed text. Manage them via:
 
-- **Web UI**: `http://localhost:8080` → Actions panel
-- **REST API**: `POST /api/actions`
+- **Settings window → Action dropdown** (read from backend)
+- **REST API**: `POST /api/actions` (requires auth)
 - **Config file**: `backend/config/default_actions.json`
 
 **Built-in action types:**
@@ -124,24 +175,20 @@ Actions define what happens with transcribed text. Manage them via:
 - **notification** — Show macOS notification with transcribed text
 - **http_post** — Send to a webhook (configure your URL)
 
-### Web Dashboard
+### ProcessSupervisor
 
-The backend serves a real-time dashboard at **http://localhost:8080**:
+The Swift app's `ProcessSupervisor` is the single source of truth for process
+lifecycle. It:
 
-- **Waveform visualization** — Animated audio bars react to recording state
-- **Status indicator** — Idle / Recording (pulsing) / Transcribing
-- **Action manager** — Create, edit, delete actions with a form UI
-- **Transcription history** — Last 50 transcriptions with timestamps
-- **System status** — Engine info, connected clients, last activity
+- Resolves OrbStack (`orb`) or Docker (`docker`) at launch — prefers OrbStack.
+- Runs `docker compose up -d --build` on first start, polls `/api/status` until healthy.
+- Spawns `python3 client/voice_client.py` as a subprocess, captures stdout/stderr to `~/.local/log/voice-module/`.
+- Stops the backend with `docker compose stop voice-backend` (preserves the container) and restarts with `docker compose restart`.
+- Sends SIGTERM to the client, then SIGKILL after a 1.5s grace period.
+- Auto-reconnects the WebSocket and re-fetches settings/actions on launch.
 
-### Microphone Animation
-
-The waveform animates based on the recording state:
-
-- **Idle**: Subtle breathing bars, barely visible
-- **Recording**: Vibrant dancing bars with warm accent glow + pulse ring
-- **Transcribing**: Bars gently breathe in amber tones
-- **Done**: Returns to idle state
+Logs are mirrored to `~/Library/Logs/VoiceModule/menu-bar.log` (also visible
+in Console.app under subsystem `com.voicemodule.activator`).
 
 ---
 
@@ -166,22 +213,17 @@ The waveform animates based on the recording state:
 }
 ```
 
-| Key | Description |
-|-----|-------------|
-| `hotkey` | Global hotkey (format: `modifier+modifier+key`) |
-| `mode` | `hold` (push-to-talk) or `toggle` |
-| `min_duration` | Skip recordings shorter than this (seconds) |
-| `beep` | Play system beep on recording start |
-| `action` | Default action name to execute |
-| `engine` | `voxtral` (local MLX) or `backend` (deprecated — backend no longer transcribes) |
-| `backend_url` | WebSocket endpoint for coordination |
+The Swift app mirrors its **own** config (hotkey, mode, action) via the
+backend at `127.0.0.1:8080/api/settings`. The Python worker reads action and
+engine settings on startup; the Swift app owns the global hotkey and sends
+recording commands to the worker.
 
 ### Hotkey Format
 
 `modifier+modifier+key` — at least one modifier required.
 
 **Modifiers:** `cmd`, `ctrl`, `alt`/`option`, `shift`
-**Special keys:** `space`, `tab`, `enter`, `esc`, `backspace`, `delete`, `up`, `down`, `left`, `right`, `f1`–`f20`
+**Special keys:** `space`, `tab`, `enter`, `esc`, `backspace`, `delete`, `up`, `down`, `left`, `right`, `home`, `end`, `page_up`, `page_down`, `f1`–`f20`
 **Regular keys:** any single character (`a`, `9`, `.`)
 
 Examples: `cmd+shift+space`, `ctrl+alt+o`, `cmd+shift+r`
@@ -199,23 +241,32 @@ LANGUAGE=en
 
 ## CLI Reference
 
-### Client
+### Menu-bar app (Swift)
 
 ```bash
-# Start with defaults
+./script/build_and_run.sh          # build + launch dist/VoiceActivator.app
+./script/build_and_run.sh --verify # build + launch + process check
+./script/build_and_run.sh --install # copy dist/VoiceActivator.app to /Applications
+pkill -x VoiceActivator            # stop
+```
+
+### Client (Python, used internally)
+
+```bash
+# Defaults
 python3 client/voice_client.py
 
-# Change hotkey
+# Override hotkey
 python3 client/voice_client.py --hotkey "ctrl+alt+o"
 
-# Change action
+# Override action
 python3 client/voice_client.py --action clipboard
 
-# Custom backend URL
-python3 client/voice_client.py --backend ws://192.168.1.100:8080/ws
-
-# Debug mode
+# Debug output
 python3 client/voice_client.py --debug
+
+# Worker mode used by VoiceActivator.app
+python3 client/voice_client.py --worker
 
 # List audio devices
 python3 client/voice_client.py --list-devices
@@ -230,15 +281,26 @@ curl http://localhost:8080/api/status
 # List actions
 curl http://localhost:8080/api/actions
 
+# Get settings
+curl http://localhost:8080/api/settings
+
+# Save settings (requires Bearer token)
+curl -X POST http://localhost:8080/api/settings \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
+  -d '{"hotkey":"cmd+shift+r","mode":"hold","action":"clipboard"}'
+
 # Add an action
 curl -X POST http://localhost:8080/api/actions \
   -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <token>" \
   -d '{"name":"my-shell","description":"Run my script","type":"terminal_command","config":{"command":"~/myscript.sh {text}"}}'
 
 # Delete an action
-curl -X DELETE http://localhost:8080/api/actions/my-shell
+curl -X DELETE http://localhost:8080/api/actions/my-shell \
+  -H "Authorization: Bearer <token>"
 
-# Get config
+# Get full config (including the auth token — unauthenticated)
 curl http://localhost:8080/api/config
 
 # Get transcription history
@@ -246,6 +308,10 @@ curl http://localhost:8080/api/history
 ```
 
 ### Legacy Standalone
+
+The legacy launcher (`start.sh`) and the standalone `voice_module.py` are
+preserved for manual / scripted use (CI, headless servers). Prefer the
+menu-bar app for daily use.
 
 ```bash
 # Without Docker (uses local faster-whisper directly)
@@ -257,15 +323,17 @@ python3 voice_module.py --model tiny.en --mode toggle
 
 ## Permissions Setup
 
-### Accessibility (required)
+### Accessibility
 
-Allows global hotkey detection.
+VoiceActivator uses a native macOS hotkey registration path. If hotkeys or
+paste/automation actions are blocked, grant Accessibility to the installed app.
 
 1. **System Settings → Privacy & Security → Accessibility**
-2. Click **+** and add your **Terminal.app** (or terminal emulator)
+2. Click **+** and add `VoiceActivator.app`
 3. Toggle must be **ON**
 
-> If you run Python directly, you may need to add the Python binary:
+> Legacy/manual Python mode still uses `pynput`. If you run Python directly,
+> you may need to add the Python binary:
 > `/opt/homebrew/opt/python@3.11/libexec/bin/python3`
 
 ### Microphone (required)
@@ -274,17 +342,36 @@ The first time you trigger a recording, macOS prompts for permission.
 If it doesn't:
 
 1. **System Settings → Privacy & Security → Microphone**
-2. Enable for **Terminal** or **python3**
+2. Enable the Python process used by the worker. If you install/run the app
+   bundle directly, also enable `VoiceActivator.app` if macOS lists it.
+
+### Notifications (optional)
+
+For the optional "Recording..." / "Transcribed: ..." banners. Grant
+`VoiceActivator.app` or the Python worker in **System Settings → Notifications**
+if macOS prompts.
 
 ---
 
 ## Troubleshooting
 
+### Menu-bar icon doesn't appear
+
+```bash
+# Is the binary built?
+ls macos/VoiceActivator/.build/release/VoiceActivator
+
+# Run with logs visible
+macos/VoiceActivator/.build/release/VoiceActivator
+# or
+tail -f ~/Library/Logs/VoiceModule/menu-bar.log
+```
+
 ### Backend won't start
 
 ```bash
 # Check OrbStack/Docker is running
-docker ps
+docker info || orb info
 
 # Check logs
 docker compose logs -f
@@ -298,7 +385,7 @@ docker compose up -d
 
 - Verify Accessibility permissions (see above)
 - Check no other app is using the same hotkey
-- Run with `--debug` to see key events
+- Run with `python3 client/voice_client.py --debug` to see key events
 
 ### "No audio / recording too short"
 
@@ -314,94 +401,67 @@ The model is `mlx-community/Voxtral-Mini-4B-Realtime-2602-4bit`.
 
 ### "Connection refused"
 
-The backend isn't running:
+The backend isn't running. From the menu bar: **Start**. From the terminal:
 
 ```bash
-# Is OrbStack/Docker running?
-docker info
-
-# Start the backend
 docker compose up -d
-
-# Check logs
 docker compose logs -f
 ```
-
-### Web UI not loading
-
-- Make sure port 8080 isn't in use by another app
-- Check: `lsof -i :8080`
-- Try a different port: edit `docker-compose.yml` ports to `8081:8080`
 
 ---
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for full development setup guide.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development setup guide.
 
 ```bash
-# Clone and start
 git clone https://github.com/mathisnaud/voice-module.git
 cd voice-module
 
-# Backend dev (with hot reload)
+# Backend (with hot reload)
 cd backend
 pip install -r requirements.txt
 uvicorn main:app --reload --host 0.0.0.0 --port 8080
 
-# Web UI dev — edit static/ files, refresh browser
-
-# Client dev
-cd client
+# Python client
+cd ../client
+pip install -r requirements.txt
+pip install mlx-audio
 python3 voice_client.py --debug
+
+# Menu-bar app (Swift)
+./script/build_and_run.sh
 ```
 
 ---
 
-## Standalone vs Docker
+## Menu-Bar App vs Standalone
 
-| Feature | Standalone (`voice_module.py`) | Docker Client/Server |
-|---------|-------------------------------|---------------------|
-| Setup | `pip install` only | Docker + pip |
-| Transcription | Local faster-whisper | Voxtral on client (Apple MLX) |
-| RAM usage | Model in main process | Backend ~50MB, Voxtral in client |
-| Web UI | ❌ | ✅ |
-| Action config | ❌ (hardcoded to opencode) | ✅ (configurable via UI/API) |
-| Multi-client | ❌ | ✅ (any client on network) |
-| Best for | Quick single-user | Always-on, multi-use, configurable |
+| Feature | Menu-Bar App (Swift) + Docker | Standalone (`voice_module.py`) |
+|---------|-------------------------------|--------------------------------|
+| UI | Native macOS menu bar (waveform icon) | Terminal only |
+| Setup | Build Swift app + Docker | `pip install` only |
+| Transcription | Voxtral on client (Apple MLX) | Local faster-whisper |
+| RAM usage | Backend ~50MB, Voxtral in client | Model in main process |
+| Settings UI | Native window (hotkey recorder, mode, action) | Config file only |
+| Action config | Live from backend (`/api/actions`) | Hardcoded to opencode |
+| Multi-client | Yes (any client on network) | No |
+| Best for | Daily use, multi-action, configurable | Quick single-user, no Docker |
 
 ---
 
-## Optional: LaunchAgent (Auto-start)
+## Optional: Install and Launch at Login
 
-Create `~/Library/LaunchAgents/com.voicemodule.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.voicemodule.client</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>/opt/homebrew/bin/python3</string>
-        <string>/path/to/client/voice_client.py</string>
-    </array>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/voicemodule.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/voicemodule.err</string>
-</dict>
-</plist>
+```bash
+./script/build_and_run.sh --install
+open /Applications/VoiceActivator.app
 ```
 
-Then: `launchctl load ~/Library/LaunchAgents/com.voicemodule.plist`
+The Settings window includes a **Launch at login** control using macOS
+`SMAppService`. If macOS reports "requires approval", approve VoiceActivator in
+**System Settings → General → Login Items**.
+
+The menu-bar app will start the backend and Python worker automatically.
 
 ---
 
@@ -415,46 +475,40 @@ can reach the API and WebSocket.
 
 ### Auth Token
 
-The backend requires authentication for action mutations (POST/PUT/DELETE /api/actions).
+The backend requires authentication for action mutations
+(`POST /api/actions`, `DELETE /api/actions/{name}`, `POST /api/settings`).
 On first startup, a random 32-byte auth token is generated and stored in the
 Docker volume at `/data/auth_token`.
 
-**Finding the token:**
+**Finding the token (host side):**
 
 ```bash
-# View in startup logs (printed to stdout)
+# View in startup logs (printed to stdout on first run)
 docker compose logs voice-backend | grep "AUTH TOKEN"
 
-# Or read directly from the volume
+# Read directly from the container
 docker compose exec voice-backend cat /data/auth_token
 ```
 
-**Setting a custom token:**
+**How the menu-bar app authenticates:**
 
-```bash
-# Write your own token into the data directory
-echo "your-secure-token-here" | docker compose exec -T voice-backend tee /data/auth_token > /dev/null
-docker compose restart voice-backend
-```
+1. On first launch, the app calls `GET /api/config` (unauthenticated) and reads the `auth_token` field.
+2. The token is cached at `~/Library/Application Support/VoiceModule/auth_token` for subsequent launches.
+3. All `POST` requests include `Authorization: Bearer <token>`.
 
-**Client authentication:**
-
-The client (`voice_client.py`) automatically fetches the token from the backend
-on first run and stores it in `~/.config/voice-module/config.json`. All mutation
-requests include the `Authorization: Bearer <token>` header.
-
-- GET endpoints (`/api/status`, `/api/config`, `/api/actions`, `/api/history`) are
-  **read-only** and do not require authentication.
-- WebSocket connections are accepted without authentication; the WebSocket relays
-  status/transcription data only (read-only from untrusted sources).
-- POST/PUT/DELETE to `/api/actions` require a valid `Authorization: Bearer <token>` header.
-
-**Token location:**
+**Where the token lives:**
 
 | Location | Path |
 |----------|------|
 | Backend (Docker volume) | `/data/auth_token` (inside container) |
-| Client (local config) | `~/.config/voice-module/config.json` → `auth_token` key |
+| Menu-bar app cache | `~/Library/Application Support/VoiceModule/auth_token` |
+| Python client cache | `~/.config/voice-module/config.json` → `auth_token` key |
+
+**Notes:**
+
+- `GET` endpoints (`/api/status`, `/api/config`, `/api/actions`, `/api/history`) are **read-only** and do not require authentication.
+- WebSocket connections are accepted without authentication; the WebSocket relays status/transcription data only.
+- WebSocket messages from untrusted sources cannot mutate settings or actions — the only mutations are REST `POST`/`DELETE` calls that require the Bearer token.
 
 ### CORS
 

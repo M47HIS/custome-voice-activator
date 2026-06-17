@@ -46,3 +46,11 @@ logs/
 
 # Backend data (runtime)
 backend/data/
+
+# Swift / SwiftPM
+macos/VoiceActivator/.build/
+macos/VoiceActivator/.swiftpm/
+macos/VoiceActivator/Package.resolved
+*.xcodeproj/
+*.xcworkspace/
+DerivedData/

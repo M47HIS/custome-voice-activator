@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import atexit
 import json
 import logging
 import os
@@ -63,9 +64,9 @@ except ImportError:
 _voxtral_available = True
 try:
     from mlx_audio.stt.utils import load as mlx_load
-except ImportError:
+except Exception as e:
     _voxtral_available = False
-    log.warning("mlx-audio not installed. Voxtral transcription unavailable.")
+    log.warning(f"mlx-audio unavailable. Voxtral transcription unavailable: {e}")
     log.warning("Install with: pip install mlx-audio")
     log.warning("Will fall back to backend transcription if available.")
 
@@ -93,6 +94,8 @@ DEFAULT_CONFIG: dict = {
 
 CONFIG_DIR = Path.home() / ".config" / "voice-module"
 CONFIG_PATH = CONFIG_DIR / "config.json"
+APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "VoiceModule"
+PID_PATH = APP_SUPPORT_DIR / "voice_client.pid"
 
 # Backward compat: existing config keys
 CONFIG_MAP = {
@@ -140,6 +143,41 @@ def save_config(cfg: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
+
+
+def _pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return False
+
+
+def claim_pid_file() -> None:
+    """Publish this process so the menu-bar app does not spawn duplicates."""
+    if PID_PATH.exists():
+        try:
+            existing = int(PID_PATH.read_text().strip())
+        except (OSError, ValueError):
+            existing = 0
+        if existing and existing != os.getpid() and _pid_is_running(existing):
+            log.error(f"Voice client already running (pid={existing}).")
+            sys.exit(1)
+
+    APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+    PID_PATH.write_text(f"{os.getpid()}\n")
+
+
+def clear_pid_file() -> None:
+    try:
+        if PID_PATH.exists() and PID_PATH.read_text().strip() == str(os.getpid()):
+            PID_PATH.unlink()
+    except OSError:
+        pass
 
 
 # ── Hotkey parsing ────────────────────────────────────────────────────────────
@@ -644,6 +682,7 @@ class VoiceClient:
         self._running = False
         self._listener: pynput_keyboard.Listener | None = None
         self._action: dict | None = None
+        self._worker_mode = False
 
     # ── hotkey state ──────────────────────────────────────────────────────
 
@@ -697,10 +736,12 @@ class VoiceClient:
                 threading.Thread(target=beep, daemon=True).start()
             if self.backend.is_connected():
                 self.backend.send_status("listening")
+            self._emit_worker_event({"type": "status", "state": "listening"})
             notify("Voice Module", "Recording... (release to transcribe)")
             log.info("Recording started")
         except Exception as e:
             log.error(f"Recording start error: {e}")
+            self._emit_worker_event({"type": "error", "message": str(e)})
             notify("Voice Module Error", str(e))
 
     def _stop_recording(self):
@@ -713,10 +754,12 @@ class VoiceClient:
             notify("Voice Module", "Recording too short — skipped.")
             if self.backend.is_connected():
                 self.backend.send_status("idle")
+            self._emit_worker_event({"type": "status", "state": "idle"})
             return
 
         log.info(f"Captured ~{duration:.1f}s, transcribing...")
         notify("Voice Module", "Transcribing...")
+        self._emit_worker_event({"type": "status", "state": "transcribing"})
 
         if self.backend.is_connected():
             self.backend.send_status("transcribing")
@@ -749,6 +792,8 @@ class VoiceClient:
                 notify("Voice Module Error", f"Transcription failed: {e}")
                 if self.backend.is_connected():
                     self.backend.send_status("idle")
+                self._emit_worker_event({"type": "status", "state": "idle"})
+                self._emit_worker_event({"type": "error", "message": f"Transcription failed: {e}"})
                 return
         else:
             # ── Backend fallback (legacy faster-whisper) ──
@@ -758,14 +803,17 @@ class VoiceClient:
 
         if self.backend.is_connected():
             self.backend.send_status("idle")
+        self._emit_worker_event({"type": "status", "state": "idle"})
 
         if text is None:
             log.error("Transcription failed")
+            self._emit_worker_event({"type": "error", "message": "Transcription failed"})
             notify("Voice Module Error", "Transcription failed")
             return
 
         if text:
             log.info(f'"{text}"')
+            self._emit_worker_event({"type": "transcribed", "text": text})
             notify("Voice Module", text[:200])
 
             # Execute the configured action
@@ -774,38 +822,20 @@ class VoiceClient:
 
             if action is None:
                 log.warning(f"Action '{action_name}' not found on backend. Using fallback clipboard.")
-                self.runner._copy_clipboard(text)
+                ok = self.runner._copy_clipboard(text)
             else:
-                self.runner.execute(action, text)
+                ok = self.runner.execute(action, text)
+            self._emit_worker_event({"type": "action_done", "action": action_name, "ok": bool(ok)})
         else:
             log.info("No speech detected")
+            self._emit_worker_event({"type": "transcribed", "text": ""})
             notify("Voice Module", "No speech detected.")
 
     def _transcribe_via_backend(self, audio_chunks: list[bytes]) -> str | None:
-        """Fallback: send audio to backend for faster-whisper transcription."""
-        if not self.backend.is_connected():
-            log.error("Backend not connected — cannot transcribe.")
-            return None
-
-        # Send audio as binary chunks
-        with self.backend._lock:
-            ws = self.backend.ws
-        if ws:
-            for chunk in audio_chunks:
-                try:
-                    ws.send(chunk, opcode=websocket.ABNF.OPCODE_BINARY)
-                except Exception as e:
-                    log.error(f"Binary send failed: {e}")
-                    return None
-
-        # Wait for the backend's response (legacy protocol)
-        self.backend.send_message({"type": "stop"})
-        time.sleep(0.5)
-        # NOTE: The new backend protocol does not process binary frames.
-        # This fallback requires the old backend or a backend with whisper support.
-        # For now, log a clear error.
-        log.error("Backend fallback transcription is deprecated.")
-        log.error("The new backend does not process audio. Install mlx-audio for Voxtral.")
+        """Backend audio transcription is not supported by the headless API."""
+        log.error("Backend transcription is unavailable in the current headless backend.")
+        log.error("Install/fix mlx-audio for local Voxtral transcription.")
+        notify("Voice Module Error", "Backend transcription is unavailable. Fix mlx-audio.")
         return None
 
     def _ensure_auth_token(self):
@@ -864,37 +894,43 @@ class VoiceClient:
         except Exception as e:
             log.warning(f"Unexpected error fetching backend settings: {e}")
 
-    def run(self):
+    def _prepare_runtime(self, interactive: bool) -> bool:
         log.info(f"Hotkey from config: {self.cfg['hotkey']}")
         log.info(f"Engine: {'Voxtral (local MLX)' if self._use_voxtral else 'Backend fallback'}")
         log.info(f"Backend: {self.cfg['backend_url']}")
         log.info(f"Action: {self.cfg.get('action', 'opencode')}")
         log.info(f"Mic:    {self._mic_name()}")
 
-        # Check backend is running
         if not self.backend.check_backend():
             log.warning("Backend is not running!")
             log.warning("Start it with: docker compose up -d")
             log.warning(f"Or: cd backend && uvicorn main:app --host 0.0.0.0 --port 8080")
+            if not interactive:
+                self._emit_worker_event({"type": "error", "message": "Backend is not running"})
+                return False
             ans = input("Continue without backend? Action config will be unavailable. [y/N] ")
             if ans.lower() != "y":
                 log.info("Exiting. Start the backend and try again.")
-                sys.exit(0)
+                return False
 
-        # Connect WebSocket
         if not self.backend.connect():
             log.error("Failed to connect to backend WebSocket.")
+            if not interactive:
+                self._emit_worker_event({"type": "error", "message": "Failed to connect to backend WebSocket"})
+                return False
             ans = input("Continue anyway? [y/N] ")
             if ans.lower() != "y":
-                sys.exit(1)
+                return False
 
-        # Fetch auth token from backend (on first run)
         self._ensure_auth_token()
-
-        # Fetch actions & settings from backend
         self.runner.fetch_actions()
         log.info(f"Loaded {len(self.runner._actions)} actions from backend")
         self._fetch_backend_settings()
+        return True
+
+    def run(self):
+        if not self._prepare_runtime(interactive=True):
+            sys.exit(1)
 
         # Parse hotkey (after potential backend override)
         try:
@@ -927,6 +963,52 @@ class VoiceClient:
             self._listener.join(timeout=0.5)
 
         self.shutdown()
+
+    def run_worker(self):
+        self._worker_mode = True
+        signal.signal(signal.SIGINT, self._on_signal)
+        signal.signal(signal.SIGTERM, self._on_signal)
+
+        if not self._prepare_runtime(interactive=False):
+            sys.exit(1)
+
+        self._running = True
+        self._emit_worker_event({"type": "ready"})
+        log.info("Voice Module worker ready.")
+
+        while self._running:
+            line = sys.stdin.readline()
+            if not line:
+                break
+            try:
+                message = json.loads(line)
+            except json.JSONDecodeError as e:
+                self._emit_worker_event({"type": "error", "message": f"Invalid JSON command: {e}"})
+                continue
+
+            command = message.get("type")
+            if command == "start_recording":
+                if not self.recorder.is_recording:
+                    self._start_recording()
+            elif command == "stop_recording":
+                if self.recorder.is_recording:
+                    self._stop_recording()
+            elif command == "toggle_recording":
+                if self.recorder.is_recording:
+                    self._stop_recording()
+                else:
+                    self._start_recording()
+            elif command == "shutdown":
+                self._running = False
+            else:
+                self._emit_worker_event({"type": "error", "message": f"Unknown command: {command}"})
+
+        self.shutdown()
+
+    def _emit_worker_event(self, event: dict) -> None:
+        if not self._worker_mode:
+            return
+        print(json.dumps(event, ensure_ascii=False), flush=True)
 
     def _on_signal(self, signum, frame):
         log.info("\nShutting down...")
@@ -967,6 +1049,8 @@ def main():
     parser.add_argument("--debug", action="store_true", help="Verbose output")
     parser.add_argument("--list-devices", action="store_true",
                         help="List audio devices and exit")
+    parser.add_argument("--worker", action="store_true",
+                        help="Run as a JSON-command worker supervised by the macOS app")
     args = parser.parse_args()
 
     if args.debug:
@@ -996,8 +1080,17 @@ def main():
     cli_overrides = {k: v for k, v in overrides.items() if v is not None}
     config = load_config(cli_overrides)
 
+    claim_pid_file()
+    atexit.register(clear_pid_file)
+
     client = VoiceClient(config, cli_overrides)
-    client.run()
+    try:
+        if args.worker:
+            client.run_worker()
+        else:
+            client.run()
+    finally:
+        clear_pid_file()
 
 
 if __name__ == "__main__":

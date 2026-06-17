@@ -1,9 +1,10 @@
 """
-Voice Module Backend — FastAPI server for coordination, actions, and dashboard.
+Voice Module Backend — FastAPI server (headless coordination API).
 
 Lightweight coordination layer. Transcription is done client-side via Voxtral.
-Provides WebSocket endpoint for real-time status sync, REST API for action
-management, and serves the web UI dashboard.
+Provides a WebSocket endpoint for real-time status sync and a REST API for
+action + settings management. The primary UI is the native macOS menu-bar
+app (macos/VoiceActivator) — there is no web dashboard.
 """
 
 import asyncio
@@ -14,8 +15,7 @@ import secrets
 import time
 from pathlib import Path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header, Depends
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 # ── Configuration ───────────────────────────────────────────────────────────────
@@ -33,7 +33,6 @@ DEFAULT_CONFIG_PATH = Path(__file__).parent / "config" / "default_actions.json"
 DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).parent / "data")))
 ACTIONS_PATH = DATA_DIR / "actions.json"
 SETTINGS_PATH = DATA_DIR / "settings.json"
-STATIC_DIR = Path(__file__).parent / "static"
 
 # ── App ─────────────────────────────────────────────────────────────────────────
 
@@ -377,14 +376,3 @@ async def websocket_endpoint(ws: WebSocket):
         logger.error(f"WebSocket error: {e}")
     finally:
         state.connected_clients.discard(ws)
-
-
-# ── Static Files ────────────────────────────────────────────────────────────────
-
-@app.get("/")
-async def serve_index():
-    return FileResponse(STATIC_DIR / "index.html")
-
-
-# Must be last
-app.mount("/", StaticFiles(directory=str(STATIC_DIR), html=True), name="static")
