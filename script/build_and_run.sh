@@ -205,6 +205,8 @@ cat >"$INFO_PLIST" <<PLIST
     <string>$MIN_SYSTEM_VERSION</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>VoiceActivator needs microphone access to capture audio for local voice transcription.</string>
 </dict>
 </plist>
 PLIST

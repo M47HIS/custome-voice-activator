@@ -1,4 +1,5 @@
 import AppKit
+import AVFoundation
 import Combine
 import Darwin
 import Foundation
@@ -175,6 +176,7 @@ final class ProcessSupervisor: ObservableObject {
     private var webSocketTask: Task<Void, Never>?
     private var bootstrapComplete = false
     private let hotkeyManager = HotkeyManager()
+    private let audioRecorder = AudioRecorder()
 
     func attach(backend: BackendClient, settings: SettingsStore) {
         self.backendClient = backend
@@ -265,20 +267,31 @@ final class ProcessSupervisor: ObservableObject {
     private func configureHotkey(from store: SettingsStore) throws {
         let hotkey = try Hotkey.parse(store.hotkey)
         hotkeyManager.onPressed = { [weak self] in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 if store.mode == "toggle" {
-                    self.sendWorkerCommand("toggle_recording")
+                    if self.audioRecorder.isRecording {
+                        let url = self.audioRecorder.stopRecording()
+                        LogStore.shared.log("Stopped native audio recording: \(url?.path ?? "nil")")
+                    } else {
+                        self.sendWorkerCommand("toggle_recording")
+                        try? self.audioRecorder.startRecording()
+                        LogStore.shared.log("Started native audio recording.")
+                    }
                 } else {
                     self.sendWorkerCommand("start_recording")
+                    try? self.audioRecorder.startRecording()
+                    LogStore.shared.log("Started native audio recording.")
                 }
             }
         }
         hotkeyManager.onReleased = { [weak self] in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 guard let self else { return }
                 if store.mode == "hold" {
                     self.sendWorkerCommand("stop_recording")
+                    let url = self.audioRecorder.stopRecording()
+                    LogStore.shared.log("Stopped native audio recording: \(url?.path ?? "nil")")
                 }
             }
         }
