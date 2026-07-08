@@ -1,5 +1,11 @@
 [
   {
+    "name": "paste_focused",
+    "description": "Copy to clipboard and paste into focused app (Superwhisper-style)",
+    "type": "paste_focused",
+    "config": {}
+  },
+  {
     "name": "opencode",
     "description": "Open Terminal with opencode and paste transcribed text",
     "type": "terminal_command",

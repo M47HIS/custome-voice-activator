@@ -6,12 +6,10 @@ Thanks for your interest in contributing! Here's how to get started.
 
 ### Prerequisites
 
-- **macOS** (for client + Apple Neural Engine; backend runs in Docker on any host)
-- **OrbStack** `brew install orbstack` (or Docker Desktop)
+- **macOS 13+**
+- **Xcode 15+** or Swift toolchain (`swiftlang` via Homebrew)
 - **Python 3.11+**
-- **Swift toolchain** (Xcode 15+ or `swiftlang` Homebrew formula). The menu-bar app builds with `swift build -c release`.
-- **Homebrew** (recommended, for `portaudio`)
-- `mlx-audio` (Voxtral transcription engine)
+- **OrbStack** or Docker Desktop (optional, for the backend)
 
 ### Local Development
 
@@ -20,160 +18,145 @@ Thanks for your interest in contributing! Here's how to get started.
 git clone https://github.com/mathisnaud/voice-module.git
 cd voice-module
 
-# Start the backend in OrbStack/Docker
-docker compose up -d
+# Install Python worker dependencies
+pip install -r client/requirements.txt
 
-# Or run the backend locally for faster iteration
-cd backend
-pip install -r requirements.txt
-uvicorn main:app --reload --host 0.0.0.0 --port 8080
-
-# Install client dependencies
-cd ../client
-pip install -r requirements.txt
-pip install mlx-audio
-
-# Build the menu-bar app
-cd ../macos/VoiceActivator
+# Build the Swift menu-bar app
+cd macos/VoiceActivator
 swift build -c release
-./Scripts/build_and_run.sh    # builds + launches in one step
+
+# Run it
+.build/release/VoiceActivator
 ```
 
 ### Project Structure
 
 ```
-.
-├── backend/                  # Headless FastAPI server (OrbStack/Docker)
-│   ├── main.py               # REST + WebSocket handlers (no UI, no transcription)
-│   ├── config/               # Default action definitions
-│   ├── Dockerfile
-│   └── requirements.txt
-├── client/                   # macOS native transcription client
-│   ├── voice_client.py       # Hotkey + mic + Voxtral + actions (Python)
-│   └── requirements.txt
-├── macos/VoiceActivator/     # Swift menu-bar app (primary UI)
-│   ├── Package.swift
-│   ├── Sources/VoiceActivator/
-│   │   ├── main.swift
-│   │   ├── AppDelegate.swift
-│   │   ├── StatusBarController.swift
-│   │   ├── MenuContentView.swift
-│   │   ├── SettingsWindow.swift
-│   │   ├── KeyCaptureView.swift
-│   │   ├── KeyCodes.swift
-│   │   ├── Hotkey.swift
-│   │   ├── Models.swift
-│   │   ├── BackendClient.swift
-│   │   ├── ProcessSupervisor.swift
-│   │   ├── SettingsStore.swift
-│   │   ├── AppPaths.swift
-│   │   └── LogStore.swift
-│   └── Scripts/build_and_run.sh
-├── docker-compose.yml        # Local backend stack (port 127.0.0.1:8080)
-├── voice_module.py           # Legacy standalone (faster-whisper, no Docker)
-├── requirements.txt          # Legacy standalone dependencies
-├── start.sh                  # Legacy CLI launcher (use the menu-bar app instead)
-├── setup.sh
+macos/VoiceActivator/     Swift menu-bar app (primary UI)
+  Package.swift
+  Sources/VoiceActivator/
+    main.swift              Entry point (NSApplication + accessory policy)
+    AppDelegate.swift       Bootstrap: supervisor + backend client + settings
+    ProcessSupervisor.swift Spawns Python worker, manages hotkey + audio
+    StatusBarController.swift Menu-bar icon (NSStatusItem)
+    MenuContentView.swift   SwiftUI dropdown menu
+    SettingsWindow.swift    Settings UI (hotkey, mode, action, permissions)
+    HotkeyManager.swift     Native global hotkey (Carbon RegisterEventHotKey)
+    Hotkey.swift            Hotkey parsing (Python-style "cmd+shift+space")
+    AudioRecorder.swift     Native mic recording (AVFoundation)
+    BackendClient.swift     REST + WebSocket client for optional Docker backend
+    SettingsStore.swift     UI-facing settings model
+    Models.swift            Wire models (BackendSettings, Action, etc.)
+    AppPaths.swift          Centralized filesystem paths
+    LogStore.swift          File-backed logger
+    AppDiagnostics.swift    Permission checks, Python deps check
+    KeyCodes.swift          macOS key code ↔ token mapping
+    KeyCaptureView.swift    SwiftUI hotkey capture widget
+
+client/                   Python worker
+  voice_client.py         Hotkey + mic + Voxtral + actions (worker mode)
+  requirements.txt        Python dependencies
+
+backend/                  Optional Docker coordination layer
+  main.py                 FastAPI server (actions, settings, history, WebSocket)
+  transcriber.py          Pluggable transcription (faster-whisper or custom)
+  config/                 Default action definitions
+  Dockerfile
+  requirements.txt
+
+docker-compose.yml        Optional backend stack (127.0.0.1:8080)
+legacy/                   Archived pre-v1 files (browser UI, standalone script)
 ```
 
-## How It Works
+## Architecture
 
 ```
-┌────────────────────────┐   WebSocket/REST    ┌──────────────────────┐
-│  macOS menu-bar app     │ ◄────────────────► │  Backend (OrbStack)  │
-│  (Swift, primary UI)    │  settings, status  │                      │
-│                        │                    │  FastAPI :8080        │
-│  - ProcessSupervisor   │                    │  Actions + History    │
-│  - BackendClient       │                    │  No UI (headless)     │
-│  - Settings window     │                    │                      │
-└────────────┬───────────┘                    └──────────────────────┘
-             │ spawns
-             ▼
 ┌────────────────────────┐
-│  Python client         │   WebSocket        ┌──────────────────────┐
-│  voice_client.py       │ ◄────────────────► │  Backend              │
-│                        │                    │                      │
-│  - pynput hotkey        │                    │  Status relay         │
-│  - sounddevice mic     │                    │  Transcription log    │
-│  - Voxtral (Apple MLX) │                    │  Action config source │
-│  - Action runner        │                    │                      │
-└────────────────────────┘                    └──────────────────────┘
+│  VoiceActivator.app    │  Swift menu-bar app
+│  (native hotkey + mic) │  Settings, process supervisor
+└───────────┬────────────┘
+            │ spawns + JSON stdin/stdout
+            ▼
+┌────────────────────────┐
+│  voice_client.py       │  Python worker (--worker mode)
+│  --worker              │  Transcription + action execution
+│                        │
+│  - Voxtral (MLX)       │  Apple Neural Engine
+│  - Custom command      │  User-provided model runner
+│  - paste_focused       │  pbcopy + ⌘V into focused app
+└────────────────────────┘
+            │ optional WebSocket
+            ▼
+┌────────────────────────┐
+│  Docker backend        │  Action config, history, settings
+│  (FastAPI :8080)       │  Not required for core loop
+└────────────────────────┘
 ```
 
-**Voxtral** transcribes audio on the client using Apple Neural Engine.
-The backend is a lightweight coordination layer — no model loading,
-no audio processing, no ffmpeg required.
+The Swift app handles the native hotkey and microphone recording. It sends
+`transcribe_file` JSON commands to the Python worker via stdin. The worker
+transcribes the audio and executes the configured action (default: paste into
+the focused app).
 
-WebSocket protocol:
-- Client sends: `{"type":"hello","role":"client"}`, `{"type":"status","state":"listening|transcribing|idle"}`, `{"type":"transcription","text":"...","is_final":true}`
-- Server broadcasts status and transcription to all UI observers
-- No binary audio frames
-
-## Swift build & test
+## Swift Build & Test
 
 ```bash
 cd macos/VoiceActivator
-swift build -c release         # builds .build/release/VoiceActivator
+swift build -c release         # production build
 swift build                    # debug build
-./Scripts/build_and_run.sh     # build + launch
+.build/release/VoiceActivator  # run
 ```
 
-The Swift app targets **macOS 13+** (`MenuBarExtra`, `Window` scene). The
-log file is written to `~/Library/Logs/VoiceModule/menu-bar.log`.
+The app targets **macOS 13+** (`MenuBarExtra`, `Window` scene, `SMAppService`).
+Logs are written to `~/Library/Logs/VoiceModule/menu-bar.log`.
 
 ## Pull Request Process
 
 1. Fork the repo and create a feature branch from `main`.
-2. Write or update tests for your changes.
-3. Update documentation if your change affects user-facing behavior.
-4. Ensure `README.md` is up to date with any new features.
-5. Open a PR with a clear description of what changed and why.
+2. Update documentation if the change affects user-facing behavior.
+3. Ensure `README.md` is up to date.
+4. Open a PR with a clear description of what changed and why.
 
 ## Code Style
 
 - **Python**: Follow [PEP 8](https://peps.python.org/pep-0008/). Use type hints where practical.
 - **Swift**: Follow standard Swift API design guidelines. Async/await for I/O. `@MainActor` for UI state. No force-unwraps (`try!`, `!`).
-- **No inline `onclick`** in any SwiftUI view — use `Button(action:)` with closures.
-- Keep files small and focused. No file should exceed ~600 lines without good reason.
+- Keep files small and focused.
 
 ## Commit Messages
 
 Use conventional commit format:
 
 ```
-feat: add Voxtral local transcription
-fix: hotkey listener crashes after Mac sleep
-docs: update README with menu-bar app setup
-refactor: extract VoxtralTranscriber from voice_client.py
+feat: add paste_focused action for Superwhisper-style paste
+fix: worker crashes when backend is unavailable
+docs: rewrite README for native app architecture
+refactor: extract custom command engine from Voxtral path
 ```
 
 ## Testing
 
 ```bash
 # Python syntax check
-PYTHONPYCACHEPREFIX=/private/tmp/voice-module-pycache \
-  python3 -m py_compile voice_module.py client/voice_client.py backend/main.py
+python3 -m py_compile client/voice_client.py backend/main.py backend/transcriber.py
 
 # Swift build
-cd macos/VoiceActivator
-swift build -c release
+cd macos/VoiceActivator && swift build -c release
 
 # Manual smoke test
-docker compose config           # verify 127.0.0.1:8080 binding
-docker compose up -d
-curl http://localhost:8080/api/status
-cd client && python3 voice_client.py --list-devices
+macos/VoiceActivator/.build/release/VoiceActivator
+# → menu-bar icon appears, hotkey works, transcription works
 ```
 
 ## Release Checklist
 
 - [ ] All PRs merged with passing checks
-- [ ] `README.md` updated with any new features
-- [ ] Version bumped in relevant files
-- [ ] Docker image built and tested
-- [ ] Swift menu-bar app builds clean (`swift build -c release`)
-- [ ] GitHub release drafted with changelog
+- [ ] `README.md` updated
+- [ ] Swift app builds clean (`swift build -c release`)
+- [ ] Python worker compiles (`python3 -m py_compile client/voice_client.py`)
+- [ ] Manual smoke test passed
+- [ ] GitHub release drafted
 
 ## Questions?
 
-Open an issue or start a discussion. We're happy to help!
+Open an issue or start a discussion.

@@ -19,6 +19,7 @@ import atexit
 import json
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import sys
@@ -87,9 +88,10 @@ DEFAULT_CONFIG: dict = {
     "debug": False,
     "backend_url": "ws://localhost:8080/ws",
     "backend_http": "http://localhost:8080",
-    "action": "opencode",  # default action name
+    "action": "paste_focused",  # default action name
     "engine": "voxtral",   # voxtral (local MLX) or backend (faster-whisper fallback)
     "auth_token": "",      # backend auth token (fetched automatically on first run)
+    "transcribe_command": "",  # custom transcription command (overrides voxtral)
 }
 
 CONFIG_DIR = Path.home() / ".config" / "voice-module"
@@ -519,6 +521,21 @@ class BackendClient:
 class ActionRunner:
     """Executes configured actions with transcribed text."""
 
+    BUILTIN_ACTIONS: list[dict] = [
+        {
+            "name": "paste_focused",
+            "description": "Copy to clipboard and paste into focused app",
+            "type": "paste_focused",
+            "config": {},
+        },
+        {
+            "name": "clipboard",
+            "description": "Copy transcribed text to clipboard",
+            "type": "clipboard",
+            "config": {},
+        },
+    ]
+
     def __init__(self, http_url: str, auth_token: str = ""):
         self.http_url = http_url
         self._actions: list[dict] = []
@@ -543,8 +560,11 @@ class ActionRunner:
         return self._actions
 
     def get_action(self, name: str) -> dict | None:
-        """Get a specific action by name."""
+        """Get a specific action by name, falling back to built-in actions."""
         for action in self._actions:
+            if action["name"] == name:
+                return action
+        for action in self.BUILTIN_ACTIONS:
             if action["name"] == name:
                 return action
         return None
@@ -561,6 +581,8 @@ class ActionRunner:
                 return self._run_terminal(text, config)
             elif action_type == "clipboard":
                 return self._copy_clipboard(text)
+            elif action_type == "paste_focused":
+                return self._paste_focused(text)
             elif action_type == "open_app":
                 return self._open_app(text, config)
             elif action_type == "http_request":
@@ -613,6 +635,18 @@ class ActionRunner:
         subprocess.run(["pbcopy"], input=text.encode(), check=True)
         log.info("Text copied to clipboard")
         notify("Voice Module", "Text copied to clipboard")
+        return True
+
+    def _paste_focused(self, text: str) -> bool:
+        subprocess.run(["pbcopy"], input=text.encode(), check=True)
+        time.sleep(0.05)
+        applescript = '''
+tell application "System Events"
+    keystroke "v" using command down
+end tell
+'''
+        subprocess.run(["osascript", "-e", applescript], check=True)
+        log.info("Text pasted into focused app")
         return True
 
     def _open_app(self, text: str, config: dict) -> bool:
@@ -674,6 +708,7 @@ class VoiceClient:
         self._use_voxtral = (
             config.get("engine", "voxtral") == "voxtral" and _voxtral_available
         )
+        self._custom_command = config.get("transcribe_command", "") or os.getenv("TRANSCRIBE_COMMAND", "").strip()
 
         self._mods: set[pynput_keyboard.Key] = set()
         self._trigger: pynput_keyboard.Key | None = None
@@ -766,7 +801,30 @@ class VoiceClient:
 
         text: str | None = None
 
-        if self._use_voxtral:
+        if self._custom_command:
+            # ── Custom command transcription ──
+            try:
+                raw = b"".join(audio_chunks)
+                text = self._transcribe_with_command(raw)
+                if self.backend.is_connected():
+                    if text:
+                        self.backend.send_transcription(text)
+                    else:
+                        self.backend.send_message({
+                            "type": "transcription",
+                            "text": "",
+                            "is_final": True,
+                            "empty": True,
+                        })
+            except Exception as e:
+                log.error(f"Custom command transcription failed: {e}")
+                notify("Voice Module Error", f"Transcription failed: {e}")
+                if self.backend.is_connected():
+                    self.backend.send_status("idle")
+                self._emit_worker_event({"type": "status", "state": "idle"})
+                self._emit_worker_event({"type": "error", "message": f"Transcription failed: {e}"})
+                return
+        elif self._use_voxtral:
             # ── Voxtral local transcription ──
             try:
                 if self._transcriber is None:
@@ -817,7 +875,7 @@ class VoiceClient:
             notify("Voice Module", text[:200])
 
             # Execute the configured action
-            action_name = self.cfg.get("action", "opencode")
+            action_name = self.cfg.get("action", "paste_focused")
             action = self.runner.get_action(action_name)
 
             if action is None:
@@ -830,6 +888,42 @@ class VoiceClient:
             log.info("No speech detected")
             self._emit_worker_event({"type": "transcribed", "text": ""})
             notify("Voice Module", "No speech detected.")
+
+    def _transcribe_with_command(self, raw_bytes: bytes | None = None, path: str | None = None) -> str:
+        """Run a custom transcription command. Accepts raw bytes or a file path."""
+        tmp_path = None
+        try:
+            if path:
+                file_path = path
+            else:
+                fd, tmp_path = tempfile.mkstemp(suffix=".wav", prefix="cmd_")
+                os.close(fd)
+                with wave.open(tmp_path, "wb") as wf:
+                    samples = np.frombuffer(raw_bytes, dtype=np.int16)
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(self.cfg["sample_rate"])
+                    wf.writeframes(samples.tobytes())
+                file_path = tmp_path
+
+            cmd = self._custom_command
+            if "{file}" in cmd:
+                cmd = cmd.replace("{file}", file_path)
+            else:
+                cmd = f"{cmd} {file_path}"
+
+            parts = shlex.split(cmd)
+            result = subprocess.run(parts, capture_output=True, text=True, timeout=300)
+            if result.returncode != 0:
+                log.error(f"Transcribe command failed (rc={result.returncode}): {result.stderr}")
+                raise RuntimeError(f"Transcribe command failed: {result.stderr.strip()}")
+            return result.stdout.strip()
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def _transcribe_via_backend(self, audio_chunks: list[bytes]) -> str | None:
         """Backend audio transcription is not supported by the headless API."""
@@ -897,35 +991,51 @@ class VoiceClient:
     def _prepare_runtime(self, interactive: bool) -> bool:
         log.info(f"Hotkey from config: {self.cfg['hotkey']}")
         log.info(f"Engine: {'Voxtral (local MLX)' if self._use_voxtral else 'Backend fallback'}")
+        if self._custom_command:
+            log.info(f"Custom transcribe command: {self._custom_command}")
         log.info(f"Backend: {self.cfg['backend_url']}")
-        log.info(f"Action: {self.cfg.get('action', 'opencode')}")
+        log.info(f"Action: {self.cfg.get('action', 'paste_focused')}")
         log.info(f"Mic:    {self._mic_name()}")
 
+        backend_available = True
+
         if not self.backend.check_backend():
-            log.warning("Backend is not running!")
-            log.warning("Start it with: docker compose up -d")
-            log.warning(f"Or: cd backend && uvicorn main:app --host 0.0.0.0 --port 8080")
-            if not interactive:
-                self._emit_worker_event({"type": "error", "message": "Backend is not running"})
-                return False
-            ans = input("Continue without backend? Action config will be unavailable. [y/N] ")
-            if ans.lower() != "y":
-                log.info("Exiting. Start the backend and try again.")
-                return False
+            if self._worker_mode:
+                log.warning("Backend is not running — worker will operate without it.")
+                backend_available = False
+            else:
+                log.warning("Backend is not running!")
+                log.warning("Start it with: docker compose up -d")
+                log.warning(f"Or: cd backend && uvicorn main:app --host 0.0.0.0 --port 8080")
+                if not interactive:
+                    self._emit_worker_event({"type": "error", "message": "Backend is not running"})
+                    return False
+                ans = input("Continue without backend? Action config will be unavailable. [y/N] ")
+                if ans.lower() != "y":
+                    log.info("Exiting. Start the backend and try again.")
+                    return False
 
-        if not self.backend.connect():
-            log.error("Failed to connect to backend WebSocket.")
-            if not interactive:
-                self._emit_worker_event({"type": "error", "message": "Failed to connect to backend WebSocket"})
-                return False
-            ans = input("Continue anyway? [y/N] ")
-            if ans.lower() != "y":
-                return False
+        if backend_available and not self.backend.connect():
+            if self._worker_mode:
+                log.warning("Failed to connect to backend WebSocket — worker will operate without it.")
+                backend_available = False
+            else:
+                log.error("Failed to connect to backend WebSocket.")
+                if not interactive:
+                    self._emit_worker_event({"type": "error", "message": "Failed to connect to backend WebSocket"})
+                    return False
+                ans = input("Continue anyway? [y/N] ")
+                if ans.lower() != "y":
+                    return False
 
-        self._ensure_auth_token()
-        self.runner.fetch_actions()
-        log.info(f"Loaded {len(self.runner._actions)} actions from backend")
-        self._fetch_backend_settings()
+        if backend_available:
+            self._ensure_auth_token()
+            self.runner.fetch_actions()
+            log.info(f"Loaded {len(self.runner._actions)} actions from backend")
+            self._fetch_backend_settings()
+        else:
+            log.info("Backend unavailable — using built-in actions only.")
+
         return True
 
     def run(self):
@@ -1047,7 +1157,16 @@ class VoiceClient:
         self._emit_worker_event({"type": "status", "state": "transcribing"})
 
         text: str | None = None
-        if self._use_voxtral:
+        if self._custom_command:
+            try:
+                text = self._transcribe_with_command(path=path)
+            except Exception as e:
+                log.error(f"Custom command transcription failed: {e}")
+                self._emit_worker_event({"type": "error", "message": f"Transcription failed: {e}"})
+                self._emit_worker_event({"type": "status", "state": "idle"})
+                self._cleanup_wav(path)
+                return
+        elif self._use_voxtral:
             try:
                 if self._transcriber is None:
                     self._transcriber = VoxtralTranscriber(
@@ -1078,7 +1197,7 @@ class VoiceClient:
             log.info(f'"{text}"')
             self._emit_worker_event({"type": "transcribed", "text": text})
 
-            action_name = self.cfg.get("action", "opencode")
+            action_name = self.cfg.get("action", "paste_focused")
             action = self.runner.get_action(action_name)
             if action is None:
                 log.warning(

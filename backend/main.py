@@ -1,10 +1,9 @@
 """
-Voice Module Backend — FastAPI server (headless coordination API).
+Voice Module Backend — optional coordination layer for the native macOS app.
 
-Lightweight coordination layer. Transcription is done client-side via Voxtral.
-Provides a WebSocket endpoint for real-time status sync and a REST API for
-action + settings management. The primary UI is the native macOS menu-bar
-app (macos/VoiceActivator) — there is no web dashboard.
+Provides action/settings APIs and WebSocket status relay. The native
+VoiceActivator.app handles hotkey, recording, and transcription directly
+via its Python worker. This backend is optional — the app works without it.
 """
 
 import asyncio
@@ -12,11 +11,15 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import time
 from pathlib import Path
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Header, Depends
+from tempfile import NamedTemporaryFile
+
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+
+from transcriber import Transcriber, TranscriptionError
 
 # ── Configuration ───────────────────────────────────────────────────────────────
 
@@ -26,25 +29,18 @@ logging.basicConfig(
 )
 logger = logging.getLogger("voice-backend")
 
-ENGINE = os.getenv("ENGINE", "voxtral")
+ENGINE = os.getenv("ENGINE", "faster-whisper")
 LANGUAGE = os.getenv("LANGUAGE", "en")
 
 DEFAULT_CONFIG_PATH = Path(__file__).parent / "config" / "default_actions.json"
 DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).parent / "data")))
 ACTIONS_PATH = DATA_DIR / "actions.json"
 SETTINGS_PATH = DATA_DIR / "settings.json"
+UPLOAD_DIR = DATA_DIR / "uploads"
 
 # ── App ─────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Voice Module Backend", version="2.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:8080", "http://127.0.0.1:8080"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 # ── Global State ────────────────────────────────────────────────────────────────
 
@@ -91,6 +87,7 @@ class ServerState:
 
 
 state = ServerState()
+transcriber = Transcriber()
 
 # ── Auth Token ──────────────────────────────────────────────────────────────────
 
@@ -143,6 +140,7 @@ def verify_auth_token(authorization: str | None = Header(None)) -> str:
 @app.on_event("startup")
 async def startup():
     logger.info(f"Voice Module backend starting (engine: {ENGINE})")
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     # Load or create auth token
     _load_or_create_auth_token()
     # Load actions
@@ -291,10 +289,53 @@ async def get_status():
         "state": state.state,
         "engine": state.engine,
         "language": LANGUAGE,
+        "transcribe_command": bool(os.getenv("TRANSCRIBE_COMMAND", "").strip()),
         "connected_clients": len(state.connected_clients),
         "actions_loaded": len(_actions),
         "last_activity": state.last_activity,
     })
+
+
+@app.post("/api/transcribe")
+async def transcribe_audio(file: UploadFile = File(...)):
+    suffix = Path(file.filename or "recording.webm").suffix or ".webm"
+    temp_path: Path | None = None
+
+    await state.set_state("transcribing")
+    try:
+        with NamedTemporaryFile(delete=False, suffix=suffix, dir=UPLOAD_DIR) as tmp:
+            temp_path = Path(tmp.name)
+            shutil.copyfileobj(file.file, tmp)
+
+        logger.info(f"Transcribing uploaded audio: {temp_path.name}")
+        text = await asyncio.to_thread(transcriber.transcribe_file, temp_path)
+        text = text.strip()
+        if text:
+            state.add_transcription(text)
+            await state.broadcast({
+                "type": "transcription",
+                "text": text,
+                "is_final": True,
+            })
+        return JSONResponse({
+            "text": text,
+            "engine": transcriber.engine,
+            "model": getattr(transcriber, "model_name", ""),
+            "language": LANGUAGE,
+        })
+    except TranscriptionError as e:
+        logger.error(f"Transcription failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e)) from e
+    except Exception as e:
+        logger.exception("Unexpected transcription error")
+        raise HTTPException(status_code=500, detail=f"Transcription failed: {e}") from e
+    finally:
+        await state.set_state("idle")
+        if temp_path and temp_path.exists():
+            try:
+                temp_path.unlink()
+            except OSError:
+                logger.warning(f"Could not remove temp upload: {temp_path}")
 
 
 @app.get("/api/config")

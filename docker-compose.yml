@@ -8,8 +8,12 @@ services:
       - voice-module-data:/data
     environment:
       - DATA_DIR=/data
-      - ENGINE=${ENGINE:-voxtral}
+      - ENGINE=${ENGINE:-faster-whisper}
       - LANGUAGE=${LANGUAGE:-en}
+      - WHISPER_MODEL=${WHISPER_MODEL:-tiny.en}
+      - WHISPER_DEVICE=${WHISPER_DEVICE:-cpu}
+      - WHISPER_COMPUTE=${WHISPER_COMPUTE:-int8}
+      - TRANSCRIBE_COMMAND=${TRANSCRIBE_COMMAND:-}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/api/status"]

@@ -242,13 +242,13 @@ final class ProcessSupervisor: ObservableObject {
         do {
             try await startBackend()
         } catch {
-            LogStore.shared.error("Auto-start backend failed: \(error.localizedDescription). User can start manually.")
+            LogStore.shared.warn("Backend unavailable (optional): \(error.localizedDescription). Worker will run without backend coordination.")
         }
 
         do {
             try await startClient()
         } catch {
-            LogStore.shared.error("Auto-start client failed: \(error.localizedDescription). User can start manually.")
+            LogStore.shared.error("Client start failed: \(error.localizedDescription). Try starting manually from the menu.")
         }
 
         bootstrapComplete = true
@@ -678,15 +678,19 @@ final class ProcessSupervisor: ObservableObject {
     // MARK: - Menu state derivation
 
     func refreshMenuState() {
-        if case .error(let msg) = backend {
+        if case .error(let msg) = client {
             menuState = .error(msg)
-        } else if case .error(let msg) = client {
+        } else if client == .running {
+            // Worker is running — app is functional regardless of backend
+            if case .error(let msg) = backend {
+                menuState = .error(msg)
+            }
+            // Otherwise keep current state (idle/listening/transcribing from worker events)
+        } else if case .error(let msg) = backend {
             menuState = .error(msg)
-        } else if backend != .running {
+        } else if backend != .running && client != .starting {
+            // Backend down and worker not running — show offline
             menuState = .offline
-        } else {
-            // Backend is running and no process error is active. Keep the
-            // current WebSocket-driven idle/listening/transcribing state.
         }
         statusIconName = menuState.iconName
     }
