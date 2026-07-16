@@ -562,24 +562,22 @@ final class ProcessSupervisor: ObservableObject {
         installWorkerOutputHandler(outputPipe)
 
         proc.terminationHandler = { [weak self] p in
-            Task { @MainActor in
-                guard let self else { return }
-                let reason: String
-                if p.terminationReason == .exit {
-                    reason = "exited (\(p.terminationStatus))"
-                } else {
-                    reason = "terminated"
-                }
+            guard let supervisor = self else { return }
+            let processID = p.processIdentifier
+            let reason = p.terminationReason == .exit
+                ? "exited (\(p.terminationStatus))"
+                : "terminated"
+            Task { @MainActor [supervisor, processID, reason] in
                 LogStore.shared.warn("Client process \(reason).")
-                self.clearClientPID(ifMatches: p.processIdentifier)
-                if self.clientProcess?.processIdentifier == p.processIdentifier {
-                    self.clientProcess = nil
+                supervisor.clearClientPID(ifMatches: processID)
+                if supervisor.clientProcess?.processIdentifier == processID {
+                    supervisor.clientProcess = nil
                 }
-                self.workerInput = nil
-                self.workerOutput?.fileHandleForReading.readabilityHandler = nil
-                self.workerOutput = nil
-                self.client = .stopped
-                self.refreshMenuState()
+                supervisor.workerInput = nil
+                supervisor.workerOutput?.fileHandleForReading.readabilityHandler = nil
+                supervisor.workerOutput = nil
+                supervisor.client = .stopped
+                supervisor.refreshMenuState()
             }
         }
 
@@ -699,11 +697,12 @@ final class ProcessSupervisor: ObservableObject {
     private func installWorkerOutputHandler(_ pipe: Pipe) {
         let lineBuffer = WorkerLineBuffer()
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            guard let supervisor = self else { return }
             let data = handle.availableData
             guard !data.isEmpty else { return }
             for text in lineBuffer.append(data) {
-                Task { @MainActor in
-                    self?.handleWorkerEvent(text)
+                Task { @MainActor [supervisor, text] in
+                    supervisor.handleWorkerEvent(text)
                 }
             }
         }

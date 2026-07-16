@@ -205,8 +205,12 @@ final class BackendClient: ObservableObject {
             self.wsContinuations[id] = continuation
             self.receiveLoop(task: task)
             continuation.onTermination = { [weak self] _ in
-                Task { @MainActor in
-                    self?.wsContinuations[id] = nil
+                guard let client = self else {
+                    task.cancel(with: .normalClosure, reason: nil)
+                    return
+                }
+                Task { @MainActor [client, id, task] in
+                    client.wsContinuations[id] = nil
                     task.cancel(with: .normalClosure, reason: nil)
                 }
             }
