@@ -43,6 +43,11 @@ logs/
 # Secrets / user config
 .env
 *.env
+.env.*
+*.key
+*.pem
+*.p12
+*.mobileprovision
 
 # Backend data (runtime)
 backend/data/

@@ -10,7 +10,7 @@ Voxtral runs on Apple Neural Engine — no cloud, no Docker GPU needed.
 
 Usage:
     python3 client/voice_client.py
-    python3 client/voice_client.py --hotkey "ctrl+alt+o" --action opencode
+    python3 client/voice_client.py --hotkey "ctrl+alt+o" --action clipboard
     python3 client/voice_client.py --backend ws://localhost:8080/ws
 """
 
@@ -88,9 +88,9 @@ DEFAULT_CONFIG: dict = {
     "debug": False,
     "backend_url": "ws://localhost:8080/ws",
     "backend_http": "http://localhost:8080",
-    "action": "paste_focused",  # default action name
+    "action": "clipboard",
     "engine": "voxtral",   # voxtral (local MLX) or backend (faster-whisper fallback)
-    "auth_token": "",      # backend auth token (fetched automatically on first run)
+    "auth_token": "",      # optional backend token, provisioned locally
     "transcribe_command": "",  # custom transcription command (overrides voxtral)
 }
 
@@ -126,6 +126,7 @@ def load_config(cli_overrides: dict | None = None) -> dict:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         with open(CONFIG_PATH, "w") as f:
             json.dump(merged, f, indent=2)
+        os.chmod(CONFIG_PATH, 0o600)
         cfg = {}
 
     # Map old config keys to new ones (backward compat)
@@ -138,6 +139,9 @@ def load_config(cli_overrides: dict | None = None) -> dict:
     merged = {**DEFAULT_CONFIG, **cfg, **mapped}
     if cli_overrides:
         merged.update({k: v for k, v in cli_overrides.items() if v is not None})
+    if merged.get("action") == "paste_focused":
+        log.info("Migrating legacy paste_focused action to clipboard.")
+        merged["action"] = "clipboard"
     return merged
 
 
@@ -145,6 +149,7 @@ def save_config(cfg: dict) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(cfg, f, indent=2)
+    os.chmod(CONFIG_PATH, 0o600)
 
 
 def _pid_is_running(pid: int) -> bool:
@@ -415,9 +420,10 @@ class BackendClient:
     in the client via Voxtral.
     """
 
-    def __init__(self, ws_url: str, http_url: str):
+    def __init__(self, ws_url: str, http_url: str, auth_token: str = ""):
         self.ws_url = ws_url
         self.http_url = http_url
+        self.auth_token = auth_token
         self.ws: websocket.WebSocketApp | None = None
         self._connected = False
         self._ready = threading.Event()
@@ -464,6 +470,7 @@ class BackendClient:
 
         self.ws = websocket.WebSocketApp(
             self.ws_url,
+            header=[f"Authorization: Bearer {self.auth_token}"],
             on_open=on_open,
             on_message=on_message,
             on_error=on_error,
@@ -523,12 +530,6 @@ class ActionRunner:
 
     BUILTIN_ACTIONS: list[dict] = [
         {
-            "name": "paste_focused",
-            "description": "Copy to clipboard and paste into focused app",
-            "type": "paste_focused",
-            "config": {},
-        },
-        {
             "name": "clipboard",
             "description": "Copy transcribed text to clipboard",
             "type": "clipboard",
@@ -551,9 +552,16 @@ class ActionRunner:
     def fetch_actions(self) -> list[dict]:
         """Fetch actions from the backend API."""
         try:
-            resp = requests.get(f"{self.http_url}/api/actions", timeout=5)
+            resp = requests.get(
+                f"{self.http_url}/api/actions",
+                headers=self._auth_headers,
+                timeout=5,
+            )
             if resp.status_code == 200:
-                self._actions = resp.json()
+                self._actions = [
+                    action for action in resp.json()
+                    if isinstance(action, dict) and action.get("type") == "clipboard"
+                ]
                 return self._actions
         except requests.RequestException as e:
             log.warning(f"Could not fetch actions from backend: {e}")
@@ -561,32 +569,23 @@ class ActionRunner:
 
     def get_action(self, name: str) -> dict | None:
         """Get a specific action by name, falling back to built-in actions."""
-        for action in self._actions:
-            if action["name"] == name:
-                return action
         for action in self.BUILTIN_ACTIONS:
             if action["name"] == name:
+                return action
+        for action in self._actions:
+            if action.get("name") == name and action.get("type") == "clipboard":
                 return action
         return None
 
     def execute(self, action: dict, text: str) -> bool:
         """Execute an action with the transcribed text. Returns True on success."""
         action_type = action.get("type", "")
-        config = action.get("config", {})
 
         log.info(f"Executing action '{action.get('name')}' (type={action_type})")
 
         try:
-            if action_type == "terminal_command":
-                return self._run_terminal(text, config)
-            elif action_type == "clipboard":
+            if action_type == "clipboard":
                 return self._copy_clipboard(text)
-            elif action_type == "paste_focused":
-                return self._paste_focused(text)
-            elif action_type == "open_app":
-                return self._open_app(text, config)
-            elif action_type == "http_request":
-                return self._http_request(text, config)
             else:
                 log.error(f"Unknown action type: {action_type}")
                 return False
@@ -594,89 +593,11 @@ class ActionRunner:
             log.error(f"Action execution failed: {e}")
             return False
 
-    def _run_terminal(self, text: str, config: dict) -> bool:
-        command = config.get("command", "echo {text}")
-        paste = config.get("paste_text", True)
-
-        safe_text = text.replace('"', '\\"')
-        command = command.replace("{text}", safe_text)
-
-        if paste:
-            subprocess.run(["pbcopy"], input=text.encode(), check=True)
-            applescript = f'''
-            tell application "Terminal"
-                activate
-                do script "{command}"
-            end tell
-            delay 0.4
-            tell application "System Events"
-                tell process "Terminal"
-                    keystroke "v" using command down
-                    delay 0.1
-                    keystroke return
-                end tell
-            end tell
-            '''
-            subprocess.run(["osascript", "-e", applescript], check=True)
-        else:
-            escaped = command.replace("\\", "\\\\").replace('"', '\\"')
-            applescript = f'''
-            tell application "Terminal"
-                activate
-                do script "{escaped}"
-            end tell
-            '''
-            subprocess.run(["osascript", "-e", applescript], check=True)
-
-        log.info(f"Terminal command executed: {command[:60]}...")
-        return True
-
     def _copy_clipboard(self, text: str) -> bool:
         subprocess.run(["pbcopy"], input=text.encode(), check=True)
         log.info("Text copied to clipboard")
         notify("Voice Module", "Text copied to clipboard")
         return True
-
-    def _paste_focused(self, text: str) -> bool:
-        subprocess.run(["pbcopy"], input=text.encode(), check=True)
-        time.sleep(0.05)
-        applescript = '''
-tell application "System Events"
-    keystroke "v" using command down
-end tell
-'''
-        subprocess.run(["osascript", "-e", applescript], check=True)
-        log.info("Text pasted into focused app")
-        return True
-
-    def _open_app(self, text: str, config: dict) -> bool:
-        app = config.get("app", "Notes")
-        applescript = f'''
-        tell application "{app}"
-            activate
-        end tell
-        '''
-        subprocess.run(["osascript", "-e", applescript], check=True)
-        subprocess.run(["pbcopy"], input=text.encode(), check=True)
-        log.info(f"Opened {app}, text copied to clipboard")
-        return True
-
-    def _http_request(self, text: str, config: dict) -> bool:
-        url = config.get("url", "").replace("{text}", text)
-        method = config.get("method", "POST").upper()
-        headers = config.get("headers", {})
-        body_template = config.get("body_template", '{"text": "{text}"}')
-        body = body_template.replace("{text}", text.replace('"', '\\"'))
-
-        try:
-            body_json = json.loads(body)
-            resp = requests.request(method, url, json=body_json, headers=headers, timeout=10)
-        except json.JSONDecodeError:
-            resp = requests.request(method, url, data=body, headers=headers, timeout=10)
-
-        log.info(f"HTTP {method} {url} → {resp.status_code}")
-        return resp.ok
-
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -700,7 +621,11 @@ class VoiceClient:
         self.cfg = config
         self._cli_overrides = cli_overrides or {}
         self.recorder = AudioRecorder(sample_rate=config["sample_rate"])
-        self.backend = BackendClient(config["backend_url"], config["backend_http"])
+        self.backend = BackendClient(
+            config["backend_url"],
+            config["backend_http"],
+            auth_token=config.get("auth_token", ""),
+        )
         self.runner = ActionRunner(config["backend_http"], auth_token=config.get("auth_token", ""))
 
         # Voxtral transcriber (lazy-loaded)
@@ -875,7 +800,7 @@ class VoiceClient:
             notify("Voice Module", text[:200])
 
             # Execute the configured action
-            action_name = self.cfg.get("action", "paste_focused")
+            action_name = self.cfg.get("action", "clipboard")
             action = self.runner.get_action(action_name)
 
             if action is None:
@@ -932,27 +857,19 @@ class VoiceClient:
         notify("Voice Module Error", "Backend transcription is unavailable. Fix mlx-audio.")
         return None
 
-    def _ensure_auth_token(self):
-        """Fetch auth token from backend on first run and store it locally."""
-        if self.cfg.get("auth_token", "").strip():
-            return  # Already have a token
-
-        log.info("No local auth token — fetching from backend...")
-        try:
-            resp = requests.get(f"{self.cfg['backend_http']}/api/config", timeout=5)
-            if resp.status_code == 200:
-                data = resp.json()
-                token = data.get("auth_token", "")
-                if token:
-                    self.cfg["auth_token"] = token
-                    self.runner.auth_token = token
-                    save_config(self.cfg)
-                    log.info("Auth token fetched and stored locally.")
-                    return
-        except requests.RequestException as e:
-            log.warning(f"Could not fetch auth token from backend: {e}")
-
-        log.warning("No auth token available. Action mutations will not be authenticated.")
+    def _ensure_auth_token(self) -> bool:
+        """Load a locally provisioned backend token without network bootstrap."""
+        token = (
+            self.cfg.get("auth_token", "").strip()
+            or os.getenv("VOICE_MODULE_AUTH_TOKEN", "").strip()
+        )
+        if not token:
+            log.warning("No backend auth token configured; optional backend features are disabled.")
+            return False
+        self.cfg["auth_token"] = token
+        self.backend.auth_token = token
+        self.runner.auth_token = token
+        return True
 
     # ── run / shutdown ────────────────────────────────────────────────────
 
@@ -962,10 +879,14 @@ class VoiceClient:
         Priority: CLI overrides > backend settings > local config file > defaults.
         """
         try:
-            resp = requests.get(f"{self.cfg['backend_http']}/api/settings", timeout=5)
+            resp = requests.get(
+                f"{self.cfg['backend_http']}/api/settings",
+                headers=self.runner._auth_headers,
+                timeout=5,
+            )
             if resp.status_code == 200:
                 data = resp.json()
-                for key in ("hotkey", "mode", "action"):
+                for key in ("hotkey", "mode"):
                     if key in data and key not in self._cli_overrides:
                         old = self.cfg.get(key)
                         self.cfg[key] = data[key]
@@ -994,7 +915,7 @@ class VoiceClient:
         if self._custom_command:
             log.info(f"Custom transcribe command: {self._custom_command}")
         log.info(f"Backend: {self.cfg['backend_url']}")
-        log.info(f"Action: {self.cfg.get('action', 'paste_focused')}")
+        log.info(f"Action: {self.cfg.get('action', 'clipboard')}")
         log.info(f"Mic:    {self._mic_name()}")
 
         backend_available = True
@@ -1015,6 +936,9 @@ class VoiceClient:
                     log.info("Exiting. Start the backend and try again.")
                     return False
 
+        if backend_available and not self._ensure_auth_token():
+            backend_available = False
+
         if backend_available and not self.backend.connect():
             if self._worker_mode:
                 log.warning("Failed to connect to backend WebSocket — worker will operate without it.")
@@ -1029,7 +953,6 @@ class VoiceClient:
                     return False
 
         if backend_available:
-            self._ensure_auth_token()
             self.runner.fetch_actions()
             log.info(f"Loaded {len(self.runner._actions)} actions from backend")
             self._fetch_backend_settings()
@@ -1169,6 +1092,7 @@ class VoiceClient:
         elif self._use_voxtral:
             try:
                 if self._transcriber is None:
+                    self._emit_worker_event({"type": "model_loading"})
                     self._transcriber = VoxtralTranscriber(
                         sample_rate=self.cfg["sample_rate"]
                     )
@@ -1197,7 +1121,7 @@ class VoiceClient:
             log.info(f'"{text}"')
             self._emit_worker_event({"type": "transcribed", "text": text})
 
-            action_name = self.cfg.get("action", "paste_focused")
+            action_name = self.cfg.get("action", "clipboard")
             action = self.runner.get_action(action_name)
             if action is None:
                 log.warning(

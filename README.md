@@ -1,173 +1,142 @@
-# Voice Module
+# VoiceActivator
 
-macOS menu-bar app for local voice-to-text. Press a hotkey, speak, release —
-the transcript is pasted into whatever app you're using. Like Superwhisper, but
-open source and fully local.
+VoiceActivator is a small macOS menu-bar app for local voice-to-text. Hold a
+customizable shortcut, speak, release, and the transcript is copied to your
+clipboard.
 
-No audio leaves your machine. No cloud APIs.
+The default transcription path runs locally. Audio only leaves your Mac if you
+explicitly configure a custom command or integration that sends it elsewhere.
 
-## How It Works
+## What it does
 
-```
-┌─────────────────────────┐
-│  VoiceActivator.app     │  Swift menu-bar icon
-│  (native hotkey + mic)  │  Settings window, process supervisor
-└───────────┬─────────────┘
-            │ spawns
-            ▼
-┌─────────────────────────┐
-│  voice_client.py        │  Python worker
-│  --worker mode          │  Transcription + action execution
-│                         │
-│  Engine priority:       │
-│  1. TRANSCRIBE_COMMAND  │  Your own model runner
-│  2. Voxtral (MLX)       │  Apple Neural Engine
-└─────────────────────────┘
-```
+- Native menu-bar app with a compact status popover
+- Customizable global keyboard shortcut
+- Hold-to-talk and start/stop recording modes
+- Local Voxtral transcription through Apple MLX
+- Clipboard-only output, with no simulated paste or Accessibility permission
+- Short-lived recording, success, and error overlays
+- Optional custom transcription command
+- Optional authenticated local Docker backend for status coordination
 
-The Swift app owns the hotkey and microphone. The Python worker receives
-recorded audio via JSON commands, transcribes it, and executes the configured
-action (default: paste into the focused app).
+## Requirements
 
-An optional Docker backend provides action configuration and transcription
-history, but the app works without it.
+- macOS 13 or later on Apple silicon
+- Xcode 15 or a compatible Swift toolchain
+- Python 3.11 or later
+- Microphone permission for `VoiceActivator.app`
+- Several gigabytes of free space for the local model on first use
 
-## Quick Start
+## Install
+
+Clone the repository, then run:
 
 ```bash
-# Build the Swift app
-cd macos/VoiceActivator
-swift build -c release
-
-# Run it
-.build/release/VoiceActivator
+./script/build_and_run.sh --install
+open /Applications/VoiceActivator.app
 ```
 
-The app appears in your menu bar. Click the icon to see status, open settings,
-or quit.
+The installer builds the Swift app, creates a private Python environment under
+`~/Library/Application Support/VoiceModule/`, installs the worker dependencies,
+and copies the signed app to `/Applications`.
 
-### Prerequisites
+The first transcription downloads the local model. After that, click the
+menu-bar waveform icon to open Settings or check status.
 
-- **macOS 13+**
-- **Python 3.11+** with these packages:
+## Shortcut and output
 
-```bash
-pip install -r client/requirements.txt
-```
+The default shortcut is `⌘⇧Space`:
 
-- **Microphone permission** for VoiceActivator.app (prompted on first use)
-- **Accessibility permission** for paste-into-focused-app (prompted on first use)
+1. Hold the shortcut.
+2. Speak.
+3. Release it.
+4. Paste the copied transcript wherever you want.
 
-## Hotkey
+To change the shortcut, click the menu-bar icon, open Settings, click the
+shortcut field, and type a new combination. Saving re-registers it immediately.
 
-Default: **⌘⇧Space** (hold to record, release to transcribe).
-
-Change it in the Settings window (click the menu-bar icon → Settings…).
-
-## Transcription Engines
-
-The worker picks the first available engine:
-
-| Priority | Engine | How to configure |
-|----------|--------|-----------------|
-| 1 | Custom command | Set `transcribe_command` in `~/.config/voice-module/config.json` or `TRANSCRIBE_COMMAND` env var |
-| 2 | Voxtral | Automatic if `mlx-audio` is installed (default) |
-
-### Custom command
-
-Your command receives the audio file path and must print the transcript to
-stdout. Use `{file}` as a placeholder:
-
-```json
-{
-  "transcribe_command": "python3 /path/to/my_model.py {file}"
-}
-```
-
-Or via environment variable:
-
-```bash
-TRANSCRIBE_COMMAND="whisper {file} --model base.en --output_format txt" \
-  .build/release/VoiceActivator
-```
-
-### Voxtral (default)
-
-Voxtral Mini runs on Apple Neural Engine via MLX. First transcription downloads
-the model (~2 GB). Install with:
-
-```bash
-pip install mlx-audio
-```
-
-## Actions
-
-After transcription, the worker executes the configured action:
-
-| Action | What it does |
-|--------|-------------|
-| `paste_focused` | Copy to clipboard + simulate ⌘V into the focused app (default) |
-| `clipboard` | Copy to clipboard only |
-| `opencode` | Open Terminal with opencode and paste |
-| `shell` | Run a shell command with the transcript |
-
-Change the action in Settings.
-
-## Optional Docker Backend
-
-The Docker backend provides action configuration, transcription history, and
-settings sync. It is **not required** for the core record → transcribe → paste
-loop.
-
-```bash
-docker compose up -d
-```
-
-The backend binds to `127.0.0.1:8080`. Do not expose it to your network.
-
-## Project Structure
-
-```
-macos/VoiceActivator/     Swift menu-bar app (primary UI)
-client/voice_client.py    Python worker (hotkey, transcription, actions)
-backend/                  Optional Docker coordination layer
-  main.py                 FastAPI server (actions, settings, history)
-  transcriber.py          Pluggable transcription (for Docker backend)
-  config/                 Default action definitions
-docker-compose.yml        Optional backend stack
-legacy/                   Archived pre-v1 files (browser UI, standalone script)
-```
+VoiceActivator intentionally copies to the clipboard and does not synthesize a
+paste keystroke.
 
 ## Configuration
 
-User config lives at `~/.config/voice-module/config.json`:
+User configuration lives at `~/.config/voice-module/config.json`:
 
 ```json
 {
   "hotkey": "cmd+shift+space",
   "mode": "hold",
-  "action": "paste_focused",
+  "action": "clipboard",
   "transcribe_command": "",
   "language": "en",
   "engine": "voxtral"
 }
 ```
 
+Existing `paste_focused` configurations are migrated to `clipboard` when the
+worker starts.
+
+### Custom transcription command
+
+Set `transcribe_command` to a command that accepts an audio file and prints the
+transcript to standard output. `{file}` is replaced with the recording path:
+
+```json
+{
+  "transcribe_command": "whisper {file} --model base.en --output_format txt"
+}
+```
+
+You can also set `TRANSCRIBE_COMMAND` in the app's launch environment.
+
 ## Development
 
 ```bash
-# Swift build
-cd macos/VoiceActivator && swift build -c release
+# Swift tests
+swift test --package-path macos/VoiceActivator
 
-# Python syntax check
-python3 -m py_compile client/voice_client.py backend/main.py backend/transcriber.py
+# Python syntax checks
+PYTHONPYCACHEPREFIX=/private/tmp/voice-module-pycache \
+  python3 -m py_compile client/voice_client.py backend/main.py backend/transcriber.py
 
-# Run the app
-macos/VoiceActivator/.build/release/VoiceActivator
+# Full local verification
+./script/build_and_run.sh --verify
+```
 
-# Optional: start Docker backend
+The main components are:
+
+```text
+macos/VoiceActivator/   Native menu-bar app and settings UI
+client/voice_client.py  Local transcription worker
+backend/                Optional local FastAPI backend
+legacy/                 Archived browser-first prototype
+script/                 Build, install, and verification commands
+```
+
+## Optional backend
+
+The app does not require Docker. For local backend experiments only:
+
+```bash
+export VOICE_MODULE_AUTH_TOKEN="$(openssl rand -hex 32)"
 docker compose up -d
 ```
+
+Use the same token in the Python client's local `auth_token` setting or its
+`VOICE_MODULE_AUTH_TOKEN` environment variable. The backend never returns the
+token from an API and accepts sensitive REST/WebSocket traffic only from an
+authenticated loopback client. The generated token is stored in the Docker
+volume at `/data/auth_token` with user-only permissions.
+
+Only the clipboard action is accepted from backend configuration. Terminal,
+AppleScript, and webhook actions are intentionally outside the remote backend
+trust boundary.
+
+The service binds to `127.0.0.1:8080`. Do not expose it to a public network.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development guidance. Please report
+security issues according to [SECURITY.md](SECURITY.md), not in a public issue.
 
 ## License
 

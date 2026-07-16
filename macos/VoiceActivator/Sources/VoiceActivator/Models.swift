@@ -10,7 +10,7 @@ struct BackendSettings: Codable, Equatable {
     static let `default` = BackendSettings(
         hotkey: "cmd+shift+space",
         mode: "hold",
-        action: "paste_focused"
+        action: "clipboard"
     )
 }
 

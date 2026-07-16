@@ -1,10 +1,6 @@
 import AppKit
 import SwiftUI
 
-/// Singleton controller for the Settings window. We use AppKit's NSWindow
-/// directly rather than `WindowGroup` / `openWindow` because we need a single
-/// instance (the user clicking "Settings…" twice should not spawn two
-/// windows) and we want a fixed lifecycle tied to the app delegate.
 @MainActor
 final class SettingsWindowController {
     static let shared = SettingsWindowController()
@@ -13,41 +9,39 @@ final class SettingsWindowController {
 
     private init() {}
 
-    func show(supervisor: ProcessSupervisor? = nil,
-              backend: BackendClient? = nil,
-              settings: SettingsStore? = nil) {
-        // Reuse environment objects from the AppDelegate if not provided.
+    func show(
+        supervisor: ProcessSupervisor? = nil,
+        backend: BackendClient? = nil,
+        settings: SettingsStore? = nil
+    ) {
         let appDelegate = NSApp.delegate as? AppDelegate
         let resolvedSupervisor = supervisor ?? appDelegate?.supervisor
-        let resolvedBackend = backend ?? appDelegate?.backend
         let resolvedSettings = settings ?? appDelegate?.settings
+        _ = backend
 
-        guard let s = resolvedSupervisor,
-              let b = resolvedBackend,
-              let st = resolvedSettings else {
+        guard let supervisor = resolvedSupervisor, let settings = resolvedSettings else {
             LogStore.shared.error("SettingsWindowController.show: missing environment objects.")
             return
         }
 
         if window == nil {
             let view = SettingsView()
-                .environmentObject(s)
-                .environmentObject(b)
-                .environmentObject(st)
+                .environmentObject(supervisor)
+                .environmentObject(settings)
             let host = NSHostingController(rootView: view)
-            host.view.frame = NSRect(x: 0, y: 0, width: 520, height: 460)
+            host.view.frame = NSRect(x: 0, y: 0, width: 520, height: 500)
 
-            let win = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 520, height: 460),
-                styleMask: [.titled, .closable, .miniaturizable],
+            let window = NSWindow(
+                contentRect: NSRect(x: 0, y: 0, width: 520, height: 500),
+                styleMask: [.titled, .closable, .miniaturizable, .resizable],
                 backing: .buffered,
                 defer: false
             )
-            win.title = "Voice Module — Settings"
-            win.contentViewController = host
-            win.isReleasedWhenClosed = false
-            win.center()
-            self.window = win
+            window.title = "VoiceActivator Settings"
+            window.contentViewController = host
+            window.isReleasedWhenClosed = false
+            window.center()
+            self.window = window
         }
 
         window?.makeKeyAndOrderFront(nil)
@@ -57,269 +51,188 @@ final class SettingsWindowController {
 
 struct SettingsView: View {
     @EnvironmentObject var supervisor: ProcessSupervisor
-    @EnvironmentObject var backend: BackendClient
     @EnvironmentObject var settings: SettingsStore
 
     @State private var capturedHotkey: Hotkey?
-    @State private var actions: [Action] = []
-    @State private var loadError: String? = nil
-    @State private var notificationStatus: String = "checking"
-    @State private var launchAtLoginStatus: String = "checking"
-    @State private var refreshToggle: Bool = false
+    @State private var launchAtLoginStatus = "Checking Launch at Login"
+    @State private var launchAtLoginEnabled = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            // ── Header
-            HStack {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(spacing: 12) {
                 Image(systemName: "waveform.circle.fill")
-                    .imageScale(.large)
-                    .foregroundColor(.accentColor)
-                VStack(alignment: .leading) {
-                    Text("Voice Module Settings").font(.headline)
-                    Text("Changes save to the backend (127.0.0.1:8080).")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                    .font(.system(size: 28))
+                    .foregroundStyle(.tint)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("VoiceActivator")
+                        .font(.system(size: 15, weight: .semibold))
+                    Text("Local dictation, ready from the menu bar.")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
                 }
             }
 
             Form {
-                Section("Readiness") {
-                    HStack {
-                        Button("Refresh") {
-                            AppDiagnostics.invalidatePythonDepsCache()
-                            // Force re-evaluation of all readiness checks
-                            refreshToggle.toggle()
-                        }
-                        .buttonStyle(.bordered)
+                Section("Shortcut") {
+                    HStack(alignment: .center, spacing: 16) {
+                        Label("Record", systemImage: "keyboard")
                         Spacer()
-                    }
-                    ReadinessRow(label: "Hotkey registered", ok: supervisor.hotkeyRegistered)
-                    ReadinessRow(label: "Microphone", ok: AppDiagnostics.microphoneStatus == "granted")
-                    ReadinessRow(label: "Backend healthy", ok: supervisor.backend == .running)
-                    ReadinessRow(label: "Worker ready", ok: supervisor.workerReady)
-                    ReadinessRow(label: "Python deps", ok: AppDiagnostics.pythonDepsStatus() == "OK")
-                }
-
-                Section("Hotkey") {
-                    HStack(alignment: .center, spacing: 12) {
                         KeyCaptureView(
                             hotkey: $capturedHotkey,
-                            placeholder: "Click then press a hotkey..."
+                            placeholder: "Click to set"
                         )
-                        .frame(width: 220, height: 36)
-                        VStack(alignment: .leading) {
-                            Text("Current: \(settings.hotkey)")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                            Text("At least one modifier required.")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                        }
-                        Spacer()
+                        .frame(width: 210, height: 34)
                     }
-                    .onChange(of: capturedHotkey) { new in
-                        if let hk = new {
-                            settings.hotkey = hk.encode()
+                    .onChange(of: capturedHotkey) { newValue in
+                        if let hotkey = newValue {
+                            settings.hotkey = hotkey.encode()
                         }
                     }
+
+                    Text("Click the field, then press a key combination. Escape cancels capture.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
 
-                Section("Mode") {
-                    Picker("Activation", selection: $settings.mode) {
-                        Text("Hold (push-to-talk)").tag("hold")
-                        Text("Toggle (press to start, again to stop)").tag("toggle")
+                Section("Recording") {
+                    Picker("Shortcut behavior", selection: $settings.mode) {
+                        Text("Hold to talk").tag("hold")
+                        Text("Press to start and stop").tag("toggle")
                     }
                     .pickerStyle(.segmented)
-                    .labelsHidden()
+
+                    Text("Transcripts are copied to the clipboard when ready.")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
 
-                Section("Action") {
-                    Picker("Action to run on transcription", selection: $settings.action) {
-                        if actions.isEmpty {
-                            Text("Loading…").tag(settings.action)
-                        }
-                        ForEach(actions) { a in
-                            Text(actionLabel(a)).tag(a.name)
-                        }
-                    }
-                    if let err = loadError {
-                        Text("Could not load actions: \(err)")
-                            .font(.caption)
-                            .foregroundColor(.red)
-                    }
-                }
+                Section("System") {
+                    Toggle("Launch at Login", isOn: Binding(
+                        get: { launchAtLoginEnabled },
+                        set: { setLaunchAtLogin($0) }
+                    ))
 
-                Section("Status") {
-                    LabeledContent("Backend") { Text(pretty(supervisor.backend)) }
-                    LabeledContent("Client") { Text(pretty(supervisor.client)) }
-                    LabeledContent("Menu state") { Text(supervisor.menuState.label) }
-                    LabeledContent("Repo root") {
-                        Text(supervisor.repoRoot?.path ?? "unknown")
-                            .font(.caption.monospaced())
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                }
-
-                Section("Permissions") {
-                    LabeledContent("Accessibility") {
-                        Text(AppDiagnostics.accessibilityTrusted ? "granted" : "missing")
-                            .foregroundColor(AppDiagnostics.accessibilityTrusted ? .green : .orange)
-                    }
                     LabeledContent("Microphone") {
-                        Text(AppDiagnostics.microphoneStatus)
-                    }
-                    LabeledContent("Notifications") {
-                        Text(notificationStatus)
-                    }
-                    HStack {
-                        Button("Open Accessibility Settings") {
-                            AppDiagnostics.openAccessibilitySettings()
+                        HStack(spacing: 6) {
+                            Image(systemName: microphoneReady ? "checkmark.circle.fill" : "exclamationmark.circle.fill")
+                                .foregroundStyle(microphoneReady ? .green : .orange)
+                            Text(AppDiagnostics.microphoneStatus.capitalized)
+                                .foregroundStyle(.secondary)
                         }
+                    }
+
+                    if !microphoneReady {
                         Button("Open Microphone Settings") {
                             AppDiagnostics.openMicrophoneSettings()
                         }
-                        Button("Run Diagnostics") {
+                    }
+                }
+
+                Section("Diagnostics") {
+                    ReadinessRow(label: "Shortcut", ok: supervisor.hotkeyRegistered)
+                    ReadinessRow(label: "Local worker", ok: supervisor.workerReady)
+                    ReadinessRow(
+                        label: "Python dependencies",
+                        ok: AppDiagnostics.pythonDepsStatus() == "OK"
+                    )
+
+                    HStack {
+                        Button("Refresh") {
+                            AppDiagnostics.invalidatePythonDepsCache()
                             Task { await refreshDiagnostics() }
                         }
-                    }
-                    if !AppDiagnostics.accessibilityTrusted {
-                        Text("Some paste/automation actions may require granting Accessibility to VoiceActivator.app.")
-                            .font(.caption)
-                            .foregroundColor(.orange)
-                    }
-                }
-
-                Section("Startup") {
-                    LabeledContent("Launch at login") {
-                        Text(launchAtLoginStatus)
-                    }
-                    HStack {
-                        Button("Enable") {
-                            setLaunchAtLogin(true)
-                        }
-                        Button("Disable") {
-                            setLaunchAtLogin(false)
-                        }
-                    }
-                }
-
-                Section("Logs") {
-                    LabeledContent("Menu bar log") {
-                        Text(AppPaths.logFile.path)
-                            .font(.caption.monospaced())
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    LabeledContent("Client log dir") {
-                        Text(AppPaths.pythonLogDir.path)
-                            .font(.caption.monospaced())
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    HStack {
-                        Button("Reveal in Finder") {
+                        Button("Reveal Logs") {
                             NSWorkspace.shared.open(AppPaths.logDir)
                         }
+                        Spacer()
+                        Text(launchAtLoginStatus)
+                            .font(.system(size: 11))
+                            .foregroundStyle(.tertiary)
                     }
                 }
             }
             .formStyle(.grouped)
 
-            // ── Footer
-            HStack {
-                if let err = settings.saveError {
-                    Text(err)
-                        .font(.caption)
-                        .foregroundColor(.red)
+            HStack(spacing: 8) {
+                if let error = settings.saveError {
+                    Image(systemName: "exclamationmark.circle.fill")
+                        .foregroundStyle(.red)
+                    Text(error)
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
                 } else if settings.saveSuccessAt != nil {
-                    Text("Saved.")
-                        .font(.caption)
-                        .foregroundColor(.green)
-                } else {
-                    Spacer()
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                    Text("Saved")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Cancel") { NSApp.keyWindow?.performClose(nil) }
-                Button("Save") {
-                    Task { await saveAndRestartClient() }
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(settings.isSaving || !settings.isDirty)
+                Button("Cancel") { cancel() }
+                Button("Save") { saveSettings() }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(settings.isSaving || !settings.isDirty)
             }
+            .frame(height: 24)
         }
         .padding(20)
-        .frame(minWidth: 520, minHeight: 460)
+        .frame(minWidth: 500, minHeight: 460)
         .task {
-            await refreshActions()
+            capturedHotkey = try? Hotkey.parse(settings.hotkey)
             await refreshDiagnostics()
         }
     }
 
-    // MARK: - Helpers
+    private var microphoneReady: Bool {
+        AppDiagnostics.microphoneStatus == "granted"
+    }
 
-    private func refreshActions() async {
+    private func saveSettings() {
         do {
-            actions = try await backend.fetchActions()
+            try supervisor.configureHotkeyFromCurrentSettings()
+            try settings.save()
+            settings.markSaveSuccess()
+            LogStore.shared.log("Settings saved and shortcut updated.")
         } catch {
-            loadError = error.localizedDescription
+            settings.revert()
+            capturedHotkey = try? Hotkey.parse(settings.hotkey)
+            try? supervisor.configureHotkeyFromCurrentSettings()
+            settings.markSaveError(error.localizedDescription)
         }
     }
 
-    private func saveAndRestartClient() async {
-        do {
-            try await settings.save(using: backend)
-        } catch {
-            settings.markSaveError(error.localizedDescription)
-            return
-        }
-
-        do {
-            try await supervisor.restartClient()
-            try supervisor.configureHotkeyFromCurrentSettings()
-            settings.markSaveSuccess()
-            LogStore.shared.log("Settings saved and client restarted.")
-        } catch {
-            settings.markSaveError("Saved, but client restart failed: \(error.localizedDescription)")
-            LogStore.shared.error("Client restart after settings save failed: \(error.localizedDescription)")
-        }
+    private func cancel() {
+        settings.revert()
+        capturedHotkey = try? Hotkey.parse(settings.hotkey)
+        NSApp.keyWindow?.performClose(nil)
     }
 
     private func refreshDiagnostics() async {
-        notificationStatus = await AppDiagnostics.notificationStatus()
         if #available(macOS 13.0, *) {
             launchAtLoginStatus = AppDiagnostics.launchAtLoginStatus
+            launchAtLoginEnabled = launchAtLoginStatus == "enabled"
         } else {
-            launchAtLoginStatus = "unsupported"
+            launchAtLoginStatus = "Launch at Login unavailable"
+            launchAtLoginEnabled = false
         }
     }
 
     private func setLaunchAtLogin(_ enabled: Bool) {
-        if #available(macOS 13.0, *) {
-            do {
-                try AppDiagnostics.setLaunchAtLogin(enabled)
-                launchAtLoginStatus = AppDiagnostics.launchAtLoginStatus
-            } catch {
-                launchAtLoginStatus = "error: \(error.localizedDescription)"
-            }
-        } else {
-            launchAtLoginStatus = "unsupported"
+        guard #available(macOS 13.0, *) else {
+            launchAtLoginEnabled = false
+            return
+        }
+
+        do {
+            try AppDiagnostics.setLaunchAtLogin(enabled)
+            launchAtLoginStatus = AppDiagnostics.launchAtLoginStatus
+            launchAtLoginEnabled = launchAtLoginStatus == "enabled"
+        } catch {
+            settings.markSaveError("Launch at Login: \(error.localizedDescription)")
         }
     }
-
-    private func actionLabel(_ a: Action) -> String {
-        if let d = a.description, !d.isEmpty { return "\(a.name) — \(d)" }
-        return "\(a.name) (\(a.type))"
-    }
-
-    private func pretty(_ state: Any) -> String {
-        if let b = state as? BackendProcessState { return b.shortLabel }
-        if let c = state as? ClientProcessState { return c.shortLabel }
-        return "unknown"
-    }
 }
-
-// MARK: - Readiness Row
 
 private struct ReadinessRow: View {
     let label: String
@@ -327,12 +240,12 @@ private struct ReadinessRow: View {
 
     var body: some View {
         LabeledContent(label) {
-            HStack(spacing: 4) {
+            HStack(spacing: 5) {
                 Image(systemName: ok ? "checkmark.circle.fill" : "xmark.circle.fill")
-                    .foregroundColor(ok ? .green : .red)
-                Text(ok ? "Ready" : "Missing")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
+                    .foregroundStyle(ok ? .green : .red)
+                Text(ok ? "Ready" : "Needs attention")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
             }
         }
     }

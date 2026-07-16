@@ -19,6 +19,16 @@ struct Hotkey: Equatable, Hashable {
 
     var hasAnyModifier: Bool { !modifiers.isEmpty }
 
+    var displayName: String {
+        var parts: [String] = []
+        if modifiers.contains(.control) { parts.append("⌃") }
+        if modifiers.contains(.option) { parts.append("⌥") }
+        if modifiers.contains(.shift) { parts.append("⇧") }
+        if modifiers.contains(.command) { parts.append("⌘") }
+        parts.append(key == "space" ? "Space" : key.uppercased())
+        return parts.joined()
+    }
+
     /// Parse the Python-style hotkey string. Throws if no key or no modifier.
     static func parse(_ raw: String) throws -> Hotkey {
         let parts = raw

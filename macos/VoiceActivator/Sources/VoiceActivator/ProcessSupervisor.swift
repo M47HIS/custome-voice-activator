@@ -66,7 +66,9 @@ enum ClientProcessState: Equatable {
 enum MenuState: Equatable {
     case idle
     case listening
+    case loadingModel
     case transcribing
+    case success
     case error(String)
     case offline
 
@@ -74,7 +76,9 @@ enum MenuState: Equatable {
         switch self {
         case .idle: return "waveform.circle"
         case .listening: return "waveform.circle.fill"
+        case .loadingModel: return "arrow.down.circle"
         case .transcribing: return "waveform.path.ecg"
+        case .success: return "checkmark.circle.fill"
         case .error: return "exclamationmark.triangle.fill"
         case .offline: return "xmark.circle.fill"
         }
@@ -83,10 +87,36 @@ enum MenuState: Equatable {
     var label: String {
         switch self {
         case .idle: return "Idle"
-        case .listening: return "Listening"
+        case .listening: return "Recording…"
+        case .loadingModel: return "Loading local model…"
         case .transcribing: return "Transcribing"
+        case .success: return "Copied to clipboard"
         case .error(let msg): return "Error: \(msg)"
         case .offline: return "Offline"
+        }
+    }
+
+    var tint: Color {
+        switch self {
+        case .idle: return .accentColor
+        case .listening, .error: return .red
+        case .loadingModel, .transcribing: return .orange
+        case .success: return .green
+        case .offline: return .secondary
+        }
+    }
+
+    var showsOverlay: Bool {
+        switch self {
+        case .idle, .offline: return false
+        case .listening, .loadingModel, .transcribing, .success, .error: return true
+        }
+    }
+
+    var isTransient: Bool {
+        switch self {
+        case .success, .error: return true
+        default: return false
         }
     }
 }
@@ -143,6 +173,40 @@ private final class WorkerLineBuffer: @unchecked Sendable {
     }
 }
 
+private final class ProcessOutputBuffer: @unchecked Sendable {
+    private var data = Data()
+    private let lock = NSLock()
+
+    func append(_ chunk: Data) {
+        lock.lock()
+        data.append(chunk)
+        lock.unlock()
+    }
+
+    func snapshot() -> Data {
+        lock.lock()
+        defer { lock.unlock() }
+        return data
+    }
+}
+
+private final class ProcessCompletion: @unchecked Sendable {
+    private var continuation: CheckedContinuation<Void, Error>?
+    private let lock = NSLock()
+
+    init(_ continuation: CheckedContinuation<Void, Error>) {
+        self.continuation = continuation
+    }
+
+    func resume(with result: Result<Void, Error>) {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(with: result)
+    }
+}
+
 @MainActor
 final class ProcessSupervisor: ObservableObject {
     // Published state
@@ -160,6 +224,9 @@ final class ProcessSupervisor: ObservableObject {
 
     private let backendRunner = BackendRunner.resolve()
     nonisolated static func resolvedPythonPath() -> String {
+        if FileManager.default.isExecutableFile(atPath: AppPaths.pythonVirtualEnvExecutable.path) {
+            return AppPaths.pythonVirtualEnvExecutable.path
+        }
         let candidates = [
             "/opt/homebrew/opt/python@3.11/libexec/bin/python3",
             "/opt/homebrew/bin/python3",
@@ -171,26 +238,17 @@ final class ProcessSupervisor: ObservableObject {
         }
         return "/usr/bin/python3"
     }
-    private let pythonExecutable: String = {
-        let candidates = [
-            "/opt/homebrew/opt/python@3.11/libexec/bin/python3",
-            "/opt/homebrew/bin/python3",
-            "/usr/local/bin/python3",
-            "/usr/bin/python3",
-        ]
-        for candidate in candidates where FileManager.default.isExecutableFile(atPath: candidate) {
-            return candidate
-        }
-        return "/usr/bin/env"
-    }()
+    private let pythonExecutable = ProcessSupervisor.resolvedPythonPath()
 
     private var clientProcess: Process?
     private var workerInput: Pipe?
     private var workerOutput: Pipe?
     private var webSocketTask: Task<Void, Never>?
+    private var transientStateTask: Task<Void, Never>?
     private var bootstrapComplete = false
     private let hotkeyManager = HotkeyManager()
     private let audioRecorder = AudioRecorder()
+    private var registeredHotkey: Hotkey?
 
     func attach(backend: BackendClient, settings: SettingsStore) {
         self.backendClient = backend
@@ -199,10 +257,10 @@ final class ProcessSupervisor: ObservableObject {
 
     // MARK: - Bootstrap
 
-    /// Called once on app launch. Loads cached settings, fetches the auth
-    /// token, then starts the backend container and the Python client.
+    /// Called once on app launch. The native worker is the product path;
+    /// Docker remains an explicit optional integration.
     func bootstrap() async {
-        guard let backendClient, let settingsStore else {
+        guard let settingsStore else {
             LogStore.shared.error("Supervisor bootstrap called before attach().")
             return
         }
@@ -222,27 +280,12 @@ final class ProcessSupervisor: ObservableObject {
             LogStore.shared.warn("Could not locate repo root via docker-compose.yml; using CWD.")
         }
 
-        await backendClient.ensureAuthToken()
-        backendClient.startStatusPolling()
-        listenForWebSocketStatus()
-
-        do {
-            try await loadSettingsIntoStore(settingsStore, via: backendClient)
-        } catch {
-            LogStore.shared.warn("Could not load backend settings: \(error.localizedDescription). Using local defaults.")
-        }
+        backend = .stopped
+        settingsStore.load()
         do {
             try configureHotkey(from: settingsStore)
         } catch {
             LogStore.shared.error("Could not register native hotkey: \(error.localizedDescription)")
-        }
-
-        // Best-effort start the backend, then the client. Failure here should
-        // not crash the app — the user can retry from the menu.
-        do {
-            try await startBackend()
-        } catch {
-            LogStore.shared.warn("Backend unavailable (optional): \(error.localizedDescription). Worker will run without backend coordination.")
         }
 
         do {
@@ -266,11 +309,6 @@ final class ProcessSupervisor: ObservableObject {
 
     // MARK: - Settings
 
-    private func loadSettingsIntoStore(_ store: SettingsStore, via backend: BackendClient) async throws {
-        let s = try await backend.fetchSettings()
-        store.apply(remote: s)
-    }
-
     func configureHotkeyFromCurrentSettings() throws {
         guard let settingsStore else {
             throw NSError(domain: "ProcessSupervisor", code: 20, userInfo: [NSLocalizedDescriptionKey: "Settings store unavailable."])
@@ -285,20 +323,12 @@ final class ProcessSupervisor: ObservableObject {
                 guard let self else { return }
                 if store.mode == "toggle" {
                     if self.audioRecorder.isRecording {
-                        let url = self.audioRecorder.stopRecording()
-                        LogStore.shared.log("Stopped native audio recording: \(url?.path ?? "nil")")
-                        if let url {
-                            self.sendWorkerJSON(["type": "transcribe_file", "path": url.path])
-                            LogStore.shared.log("Sent transcribe_file: \(url.path)")
-                        }
+                        self.finishRecording()
                     } else {
-                        try? self.audioRecorder.startRecording()
-                        LogStore.shared.log("Started native audio recording.")
+                        await self.beginRecording()
                     }
                 } else {
-                    // hold mode: start recording on press
-                    try? self.audioRecorder.startRecording()
-                    LogStore.shared.log("Started native audio recording.")
+                    await self.beginRecording()
                 }
             }
         }
@@ -306,18 +336,86 @@ final class ProcessSupervisor: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 if store.mode == "hold" {
-                    let url = self.audioRecorder.stopRecording()
-                    LogStore.shared.log("Stopped native audio recording: \(url?.path ?? "nil")")
-                    if let url {
-                        self.sendWorkerJSON(["type": "transcribe_file", "path": url.path])
-                        LogStore.shared.log("Sent transcribe_file: \(url.path)")
-                    }
+                    self.finishRecording()
                 }
             }
         }
-        try hotkeyManager.register(hotkey)
+        let previous = registeredHotkey
+        do {
+            try hotkeyManager.register(hotkey)
+        } catch {
+            if let previous { try? hotkeyManager.register(previous) }
+            throw error
+        }
+        registeredHotkey = hotkey
         hotkeyRegistered = true
         LogStore.shared.log("Registered native hotkey: \(store.hotkey) mode=\(store.mode)")
+    }
+
+    private func beginRecording() async {
+        guard client == .running, workerReady else {
+            setMenuState(.error("Local worker is not ready"))
+            return
+        }
+
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .notDetermined:
+            let granted = await AVCaptureDevice.requestAccess(for: .audio)
+            setMenuState(granted ? .idle : .error("Microphone permission is required"))
+            return
+        case .denied, .restricted:
+            setMenuState(.error("Microphone permission is required"))
+            return
+        case .authorized:
+            break
+        @unknown default:
+            setMenuState(.error("Microphone permission is unavailable"))
+            return
+        }
+
+        do {
+            try audioRecorder.startRecording()
+            setMenuState(.listening)
+            LogStore.shared.log("Started native audio recording.")
+        } catch {
+            setMenuState(.error("Could not start recording: \(error.localizedDescription)"))
+            LogStore.shared.error("Native audio recording failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func finishRecording() {
+        guard let url = audioRecorder.stopRecording() else {
+            if menuState == .listening {
+                setMenuState(.error("No audio was captured"))
+            }
+            return
+        }
+
+        let bytes = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
+        guard bytes > 44 else {
+            try? FileManager.default.removeItem(at: url)
+            setMenuState(.error("No audio was captured; check Microphone access"))
+            LogStore.shared.error("Recorded WAV was empty (\(bytes) bytes).")
+            return
+        }
+
+        setMenuState(.transcribing)
+        sendWorkerJSON(["type": "transcribe_file", "path": url.path])
+        LogStore.shared.log("Sent \(bytes)-byte recording for transcription: \(url.path)")
+    }
+
+    private func setMenuState(_ state: MenuState) {
+        transientStateTask?.cancel()
+        menuState = state
+        statusIconName = state.iconName
+        guard state.isTransient else { return }
+
+        let delay: UInt64 = state == .success ? 1_500_000_000 : 3_000_000_000
+        transientStateTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: delay)
+            guard let self, !Task.isCancelled, self.menuState == state else { return }
+            self.setMenuState(self.client == .running ? .idle : .offline)
+        }
     }
 
     // MARK: - Backend (Docker)
@@ -326,17 +424,24 @@ final class ProcessSupervisor: ObservableObject {
         guard let root = repoRoot else {
             throw NSError(domain: "ProcessSupervisor", code: 1, userInfo: [NSLocalizedDescriptionKey: "Repo root unknown."])
         }
+
         let composeFile = root.appendingPathComponent("docker-compose.yml").path
 
         backend = .starting
         LogStore.shared.log("Starting backend via \(backendRunner.displayCommand) up -d --build...")
 
-        try await runProcess(
-            executable: backendRunner.executable,
-            args: backendRunner.leadingArgs + ["-f", composeFile, "up", "-d", "--build"],
-            env: nil,
-            description: "docker compose up"
-        )
+        do {
+            try await runProcess(
+                executable: backendRunner.executable,
+                args: backendRunner.leadingArgs + ["-f", composeFile, "up", "-d", "--build"],
+                env: nil,
+                description: "docker compose up"
+            )
+        } catch {
+            backend = .error("Start failed: \(error.localizedDescription)")
+            refreshMenuState()
+            throw error
+        }
 
         // Wait for /api/status to respond (poll).
         let healthy = await waitForBackendReady(timeoutSeconds: 60)
@@ -407,9 +512,6 @@ final class ProcessSupervisor: ObservableObject {
     // MARK: - Client (Python)
 
     func startClient() async throws {
-        guard let root = repoRoot else {
-            throw NSError(domain: "ProcessSupervisor", code: 2, userInfo: [NSLocalizedDescriptionKey: "Repo root unknown."])
-        }
         if clientProcess != nil {
             LogStore.shared.log("Client already running (pid=\(clientProcess!.processIdentifier))")
             return
@@ -424,12 +526,12 @@ final class ProcessSupervisor: ObservableObject {
             clearClientPID()
         }
 
-        let script = root.appendingPathComponent("client/voice_client.py").path
-        guard FileManager.default.fileExists(atPath: script) else {
-            client = .error("voice_client.py not found at \(script)")
+        guard let scriptURL = AppPaths.workerScript(repoRoot: repoRoot) else {
+            client = .error("voice_client.py not found in the app bundle or repository")
             refreshMenuState()
             throw NSError(domain: "ProcessSupervisor", code: 3, userInfo: [NSLocalizedDescriptionKey: "Client script missing."])
         }
+        let script = scriptURL.path
 
         client = .starting
         LogStore.shared.log("Starting Python client with \(pythonExecutable): \(script)")
@@ -437,7 +539,7 @@ final class ProcessSupervisor: ObservableObject {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: pythonExecutable)
         proc.arguments = pythonExecutable == "/usr/bin/env" ? ["python3", script, "--worker"] : [script, "--worker"]
-        proc.currentDirectoryURL = root
+        proc.currentDirectoryURL = scriptURL.deletingLastPathComponent()
 
         // Worker stdout is JSON events consumed by the menu-bar app. Stderr
         // keeps normal Python logging.
@@ -623,20 +725,28 @@ final class ProcessSupervisor: ObservableObject {
         case "status":
             let state = json["state"] as? String ?? "idle"
             switch state {
-            case "listening": menuState = .listening
-            case "transcribing": menuState = .transcribing
-            default: menuState = .idle
+            case "listening": setMenuState(.listening)
+            case "transcribing": setMenuState(.transcribing)
+            default:
+                if case .error = menuState {
+                    break
+                }
+                setMenuState(.idle)
             }
+        case "model_loading":
+            setMenuState(.loadingModel)
         case "transcribed":
             let text = json["text"] as? String ?? ""
             LogStore.shared.log("Worker transcribed \(text.count) characters.")
+            setMenuState(text.isEmpty ? .error("No speech detected") : .success)
         case "action_done":
             let action = json["action"] as? String ?? "unknown"
             let ok = json["ok"] as? Bool ?? false
             LogStore.shared.log("Worker action \(action) completed ok=\(ok).")
+            if !ok { setMenuState(.error("Could not copy transcript")) }
         case "error":
             let message = json["message"] as? String ?? "Worker error"
-            client = .error(message)
+            setMenuState(.error(message))
             LogStore.shared.error("Worker error: \(message)")
         default:
             LogStore.shared.warn("Unknown worker event: \(text)")
@@ -667,32 +777,26 @@ final class ProcessSupervisor: ObservableObject {
         guard let type = json["type"] as? String, type == "status" else { return }
         guard let state = json["state"] as? String else { return }
         switch state {
-        case "listening":    self.menuState = .listening
-        case "transcribing": self.menuState = .transcribing
-        case "idle":         self.menuState = .idle
-        default:             self.menuState = .idle
+        case "listening": setMenuState(.listening)
+        case "transcribing": setMenuState(.transcribing)
+        case "idle":
+            if case .error = menuState { return }
+            setMenuState(.idle)
+        default: setMenuState(.idle)
         }
-        self.statusIconName = self.menuState.iconName
     }
 
     // MARK: - Menu state derivation
 
     func refreshMenuState() {
         if case .error(let msg) = client {
-            menuState = .error(msg)
+            if case .error = menuState { return }
+            setMenuState(.error(msg))
         } else if client == .running {
-            // Worker is running — app is functional regardless of backend
-            if case .error(let msg) = backend {
-                menuState = .error(msg)
-            }
-            // Otherwise keep current state (idle/listening/transcribing from worker events)
-        } else if case .error(let msg) = backend {
-            menuState = .error(msg)
-        } else if backend != .running && client != .starting {
-            // Backend down and worker not running — show offline
-            menuState = .offline
+            if menuState == .offline { setMenuState(.idle) }
+        } else if client != .starting {
+            setMenuState(.offline)
         }
-        statusIconName = menuState.iconName
     }
 
     // MARK: - Process helper
@@ -701,7 +805,8 @@ final class ProcessSupervisor: ObservableObject {
         executable: String,
         args: [String],
         env: [String: String]?,
-        description: String
+        description: String,
+        timeout: TimeInterval? = nil
     ) async throws {
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let proc = Process()
@@ -711,24 +816,50 @@ final class ProcessSupervisor: ObservableObject {
             let pipe = Pipe()
             proc.standardOutput = pipe
             proc.standardError = pipe
+            let output = ProcessOutputBuffer()
+            pipe.fileHandleForReading.readabilityHandler = { handle in
+                let data = handle.availableData
+                if !data.isEmpty {
+                    output.append(data)
+                }
+            }
+
+            let completion = ProcessCompletion(cont)
 
             proc.terminationHandler = { p in
+                pipe.fileHandleForReading.readabilityHandler = nil
+                if let remaining = try? pipe.fileHandleForReading.readToEnd(), !remaining.isEmpty {
+                    output.append(remaining)
+                }
                 if p.terminationStatus == 0 {
-                    cont.resume()
+                    completion.resume(with: .success(()))
                 } else {
-                    let data = (try? pipe.fileHandleForReading.readToEnd()) ?? Data()
+                    let data = output.snapshot()
                     let msg = String(data: data, encoding: .utf8) ?? "exit \(p.terminationStatus)"
-                    cont.resume(throwing: NSError(
+                    completion.resume(with: .failure(NSError(
                         domain: "ProcessSupervisor",
                         code: Int(p.terminationStatus),
                         userInfo: [NSLocalizedDescriptionKey: "\(description) failed: \(msg)"]
-                    ))
+                    )))
                 }
             }
             do {
                 try proc.run()
             } catch {
-                cont.resume(throwing: error)
+                completion.resume(with: .failure(error))
+                return
+            }
+
+            if let timeout {
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) {
+                    guard proc.isRunning else { return }
+                    proc.terminate()
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 2) {
+                        if proc.isRunning {
+                            kill(proc.processIdentifier, SIGKILL)
+                        }
+                    }
+                }
             }
         }
     }

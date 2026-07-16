@@ -7,16 +7,17 @@ via its Python worker. This backend is optional — the app works without it.
 """
 
 import asyncio
+from collections import deque
 import json
 import logging
 import os
 import secrets
-import shutil
 import time
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from transcriber import Transcriber, TranscriptionError
@@ -37,10 +38,57 @@ DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).parent / "data")))
 ACTIONS_PATH = DATA_DIR / "actions.json"
 SETTINGS_PATH = DATA_DIR / "settings.json"
 UPLOAD_DIR = DATA_DIR / "uploads"
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(25 * 1024 * 1024)))
+MAX_TRANSCRIPT_CHARS = int(os.getenv("MAX_TRANSCRIPT_CHARS", "20000"))
+MAX_TRANSCRIPTIONS_PER_MINUTE = int(os.getenv("MAX_TRANSCRIPTIONS_PER_MINUTE", "10"))
+ALLOWED_REMOTE_ACTION_TYPES = {"clipboard"}
+LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 # ── App ─────────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="Voice Module Backend", version="2.0.0")
+
+
+def _loopback_hostname(value: str | None) -> bool:
+    if not value:
+        return False
+    try:
+        hostname = urlsplit(f"//{value}").hostname
+    except ValueError:
+        return False
+    return hostname in LOOPBACK_HOSTS
+
+
+def _allowed_origin(value: str | None) -> bool:
+    if value is None:
+        return True
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    return parsed.scheme in {"http", "https"} and parsed.hostname in LOOPBACK_HOSTS
+
+
+@app.middleware("http")
+async def enforce_loopback_request_boundary(request: Request, call_next):
+    """Reject DNS-rebinding and cross-origin browser requests."""
+    if not _loopback_hostname(request.headers.get("host")):
+        return JSONResponse(status_code=400, content={"detail": "Loopback Host required."})
+    if not _allowed_origin(request.headers.get("origin")):
+        return JSONResponse(status_code=403, content={"detail": "Origin is not allowed."})
+    if request.url.path == "/api/transcribe":
+        if not _has_valid_bearer(request.headers.get("authorization")):
+            return JSONResponse(status_code=401, content={"detail": "Authentication required."})
+        content_length = request.headers.get("content-length")
+        if content_length is None:
+            return JSONResponse(status_code=411, content={"detail": "Content-Length is required."})
+        try:
+            declared_size = int(content_length)
+        except ValueError:
+            return JSONResponse(status_code=400, content={"detail": "Invalid Content-Length."})
+        if declared_size > MAX_UPLOAD_BYTES + 1024 * 1024:
+            return JSONResponse(status_code=413, content={"detail": "Audio upload is too large."})
+    return await call_next(request)
 
 # ── Global State ────────────────────────────────────────────────────────────────
 
@@ -98,11 +146,21 @@ _auth_token: str | None = None
 def _load_or_create_auth_token() -> str:
     """Load existing auth token or create a new one on first startup."""
     global _auth_token
+    configured_token = os.getenv("VOICE_MODULE_AUTH_TOKEN", "").strip()
+    if configured_token:
+        _auth_token = configured_token
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        AUTH_TOKEN_PATH.write_text(_auth_token)
+        os.chmod(AUTH_TOKEN_PATH, 0o600)
+        logger.info("Auth token loaded from VOICE_MODULE_AUTH_TOKEN.")
+        return _auth_token
+
     if AUTH_TOKEN_PATH.exists():
         try:
             _auth_token = AUTH_TOKEN_PATH.read_text().strip()
             if not _auth_token:
                 raise ValueError("empty token file")
+            os.chmod(AUTH_TOKEN_PATH, 0o600)
             logger.info("Auth token loaded from file.")
             return _auth_token
         except Exception as e:
@@ -111,16 +169,15 @@ def _load_or_create_auth_token() -> str:
     _auth_token = secrets.token_urlsafe(32)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     AUTH_TOKEN_PATH.write_text(_auth_token)
-    logger.info("=" * 60)
-    logger.info("AUTH TOKEN CREATED (store this safely):")
-    logger.info(_auth_token)
-    logger.info("=" * 60)
-    # Print to stdout so `docker compose logs` shows it
-    print(f"\n{'=' * 60}")
-    print("AUTH TOKEN (copy and store securely):")
-    print(_auth_token)
-    print(f"{'=' * 60}\n")
+    os.chmod(AUTH_TOKEN_PATH, 0o600)
+    logger.info("Auth token created and stored in the backend data directory.")
     return _auth_token
+
+
+def _has_valid_bearer(authorization: str | None) -> bool:
+    if _auth_token is None or authorization is None or not authorization.startswith("Bearer "):
+        return False
+    return secrets.compare_digest(authorization.split(" ", 1)[1], _auth_token)
 
 
 def verify_auth_token(authorization: str | None = Header(None)) -> str:
@@ -130,7 +187,7 @@ def verify_auth_token(authorization: str | None = Header(None)) -> str:
     if authorization is None or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing or invalid Authorization header.")
     token = authorization.split(" ", 1)[1]
-    if token != _auth_token:
+    if not secrets.compare_digest(token, _auth_token):
         raise HTTPException(status_code=403, detail="Invalid auth token.")
     return token
 
@@ -155,6 +212,16 @@ async def startup():
 _actions: list[dict] = []
 
 
+def _is_safe_remote_action(action: object) -> bool:
+    return (
+        isinstance(action, dict)
+        and action.get("type") in ALLOWED_REMOTE_ACTION_TYPES
+        and isinstance(action.get("name"), str)
+        and bool(action["name"].strip())
+        and isinstance(action.get("config", {}), dict)
+    )
+
+
 def load_actions():
     global _actions
     DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -162,7 +229,8 @@ def load_actions():
     if ACTIONS_PATH.exists():
         try:
             with open(ACTIONS_PATH) as f:
-                _actions = json.load(f)
+                loaded = json.load(f)
+            _actions = [action for action in loaded if _is_safe_remote_action(action)]
             logger.info(f"Loaded {len(_actions)} actions from {ACTIONS_PATH}")
         except (json.JSONDecodeError, PermissionError) as e:
             logger.warning(f"Could not parse {ACTIONS_PATH}: {e}")
@@ -171,7 +239,8 @@ def load_actions():
         logger.info(f"Seeding actions from {DEFAULT_CONFIG_PATH}")
         try:
             with open(DEFAULT_CONFIG_PATH) as f:
-                _actions = json.load(f)
+                loaded = json.load(f)
+            _actions = [action for action in loaded if _is_safe_remote_action(action)]
             save_actions()
             logger.info(f"Seeded {len(_actions)} default actions to {ACTIONS_PATH}")
         except (json.JSONDecodeError, PermissionError) as e:
@@ -193,7 +262,7 @@ def save_actions():
 DEFAULT_SETTINGS: dict = {
     "hotkey": "cmd+shift+space",
     "mode": "hold",
-    "action": "opencode",
+    "action": "clipboard",
 }
 _settings: dict = {}
 
@@ -223,7 +292,7 @@ def save_settings():
 
 
 @app.get("/api/actions")
-async def get_actions():
+async def get_actions(_token: str = Depends(verify_auth_token)):
     return _actions
 
 
@@ -232,7 +301,11 @@ async def add_or_update_action(action: dict, _token: str = Depends(verify_auth_t
     if "name" not in action or "type" not in action:
         raise HTTPException(status_code=400, detail="Action requires 'name' and 'type' fields.")
 
-    name = action["name"]
+    if not _is_safe_remote_action(action):
+        raise HTTPException(status_code=400, detail="Only clipboard actions are accepted by the backend.")
+
+    name = action["name"].strip()
+    action = {**action, "name": name}
     existing = next((i for i, a in enumerate(_actions) if a["name"] == name), None)
     if existing is not None:
         _actions[existing] = action
@@ -258,7 +331,7 @@ async def delete_action(name: str, _token: str = Depends(verify_auth_token)):
 # ── Settings Endpoints ──────────────────────────────────────────────────────────
 
 @app.get("/api/settings")
-async def get_settings():
+async def get_settings(_token: str = Depends(verify_auth_token)):
     return _settings
 
 
@@ -275,9 +348,9 @@ async def update_settings(settings: dict, _token: str = Depends(verify_auth_toke
         _settings["mode"] = settings["mode"]
 
     if "action" in settings:
-        if not isinstance(settings["action"], str) or not settings["action"].strip():
-            raise HTTPException(status_code=400, detail="action must be a non-empty string")
-        _settings["action"] = settings["action"].strip()
+        if settings["action"] != "clipboard":
+            raise HTTPException(status_code=400, detail="action must be 'clipboard'")
+        _settings["action"] = "clipboard"
 
     save_settings()
     return _settings
@@ -296,62 +369,90 @@ async def get_status():
     })
 
 
+_transcription_slots = asyncio.Semaphore(1)
+_transcription_requests: deque[float] = deque()
+
+
+def _check_transcription_rate_limit(now: float) -> None:
+    cutoff = now - 60
+    while _transcription_requests and _transcription_requests[0] <= cutoff:
+        _transcription_requests.popleft()
+    if len(_transcription_requests) >= MAX_TRANSCRIPTIONS_PER_MINUTE:
+        raise HTTPException(status_code=429, detail="Transcription rate limit exceeded.")
+    _transcription_requests.append(now)
+
+
+async def _copy_bounded_upload(file: UploadFile, destination) -> int:
+    total = 0
+    while chunk := await file.read(1024 * 1024):
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="Audio upload is too large.")
+        destination.write(chunk)
+    return total
+
+
 @app.post("/api/transcribe")
-async def transcribe_audio(file: UploadFile = File(...)):
+async def transcribe_audio(file: UploadFile = File(...), _token: str = Depends(verify_auth_token)):
     suffix = Path(file.filename or "recording.webm").suffix or ".webm"
     temp_path: Path | None = None
 
-    await state.set_state("transcribing")
-    try:
-        with NamedTemporaryFile(delete=False, suffix=suffix, dir=UPLOAD_DIR) as tmp:
-            temp_path = Path(tmp.name)
-            shutil.copyfileobj(file.file, tmp)
+    _check_transcription_rate_limit(time.monotonic())
+    async with _transcription_slots:
+        await state.set_state("transcribing")
+        try:
+            with NamedTemporaryFile(delete=False, suffix=suffix, dir=UPLOAD_DIR) as tmp:
+                temp_path = Path(tmp.name)
+                size = await _copy_bounded_upload(file, tmp)
+            if size == 0:
+                raise HTTPException(status_code=400, detail="Audio upload is empty.")
 
-        logger.info(f"Transcribing uploaded audio: {temp_path.name}")
-        text = await asyncio.to_thread(transcriber.transcribe_file, temp_path)
-        text = text.strip()
-        if text:
-            state.add_transcription(text)
-            await state.broadcast({
-                "type": "transcription",
+            logger.info(f"Transcribing uploaded audio: {temp_path.name}")
+            text = await asyncio.to_thread(transcriber.transcribe_file, temp_path)
+            text = text.strip()
+            if text:
+                state.add_transcription(text)
+                await state.broadcast({
+                    "type": "transcription",
+                    "text": text,
+                    "is_final": True,
+                })
+            return JSONResponse({
                 "text": text,
-                "is_final": True,
+                "engine": transcriber.engine,
+                "model": getattr(transcriber, "model_name", ""),
+                "language": LANGUAGE,
             })
-        return JSONResponse({
-            "text": text,
-            "engine": transcriber.engine,
-            "model": getattr(transcriber, "model_name", ""),
-            "language": LANGUAGE,
-        })
-    except TranscriptionError as e:
-        logger.error(f"Transcription failed: {e}")
-        raise HTTPException(status_code=500, detail=str(e)) from e
-    except Exception as e:
-        logger.exception("Unexpected transcription error")
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {e}") from e
-    finally:
-        await state.set_state("idle")
-        if temp_path and temp_path.exists():
-            try:
-                temp_path.unlink()
-            except OSError:
-                logger.warning(f"Could not remove temp upload: {temp_path}")
+        except HTTPException:
+            raise
+        except TranscriptionError as e:
+            logger.error(f"Transcription failed: {e}")
+            raise HTTPException(status_code=500, detail=str(e)) from e
+        except Exception as e:
+            logger.exception("Unexpected transcription error")
+            raise HTTPException(status_code=500, detail="Transcription failed.") from e
+        finally:
+            await state.set_state("idle")
+            if temp_path and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    logger.warning(f"Could not remove temp upload: {temp_path}")
 
 
 @app.get("/api/config")
-async def get_config():
+async def get_config(_token: str = Depends(verify_auth_token)):
     return JSONResponse({
         "engine": ENGINE,
         "language": LANGUAGE,
         "ws_url": "ws://localhost:8080/ws",
         "actions": _actions,
         "settings": _settings,
-        "auth_token": _auth_token,
     })
 
 
 @app.get("/api/history")
-async def get_history():
+async def get_history(_token: str = Depends(verify_auth_token)):
     return state.transcription_history[:20]
 
 
@@ -359,6 +460,12 @@ async def get_history():
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    if not _loopback_hostname(ws.headers.get("host")) or not _allowed_origin(ws.headers.get("origin")):
+        await ws.close(code=1008, reason="Loopback origin required")
+        return
+    if not _has_valid_bearer(ws.headers.get("authorization")):
+        await ws.close(code=1008, reason="Authentication required")
+        return
     await ws.accept()
     state.connected_clients.add(ws)
     logger.info(f"WebSocket client connected ({len(state.connected_clients)} total)")
@@ -369,7 +476,7 @@ async def websocket_endpoint(ws: WebSocket):
         "state": state.state,
     }))
 
-    role: str = "ui"  # "client" or "ui"
+    role: str | None = None
 
     try:
         while True:
@@ -380,7 +487,11 @@ async def websocket_endpoint(ws: WebSocket):
                 msg_type = data.get("type")
 
                 if msg_type == "hello":
-                    role = data.get("role", "ui")
+                    requested_role = data.get("role", "ui")
+                    if requested_role not in {"client", "ui"}:
+                        await ws.close(code=1008, reason="Invalid client role")
+                        return
+                    role = requested_role
                     logger.info(f"Client registered as '{role}'")
                     await ws.send_text(json.dumps({
                         "type": "welcome",
@@ -389,15 +500,27 @@ async def websocket_endpoint(ws: WebSocket):
                     }))
 
                 elif msg_type == "status":
+                    if role != "client":
+                        await ws.close(code=1008, reason="Producer role required")
+                        return
                     # Client reports its state change
                     new_state = data.get("state", "idle")
+                    if new_state not in {"idle", "listening", "transcribing"}:
+                        await ws.close(code=1008, reason="Invalid state")
+                        return
                     await state.set_state(new_state)
                     logger.info(f"State changed to '{new_state}' by {role}")
 
                 elif msg_type == "transcription":
+                    if role != "client":
+                        await ws.close(code=1008, reason="Producer role required")
+                        return
                     # Client sends transcription result for history/logging
                     text = data.get("text", "")
                     is_final = data.get("is_final", True)
+                    if not isinstance(text, str) or len(text) > MAX_TRANSCRIPT_CHARS or not isinstance(is_final, bool):
+                        await ws.close(code=1008, reason="Invalid transcription payload")
+                        return
                     if text and is_final:
                         state.add_transcription(text)
                     # Broadcast to all observers (UI dashboards)

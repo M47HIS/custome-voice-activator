@@ -1,15 +1,9 @@
-import ApplicationServices
 import AppKit
 import AVFoundation
 import Foundation
 import ServiceManagement
-import UserNotifications
 
 enum AppDiagnostics {
-    static var accessibilityTrusted: Bool {
-        AXIsProcessTrusted()
-    }
-
     static var microphoneStatus: String {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized: return "granted"
@@ -20,26 +14,8 @@ enum AppDiagnostics {
         }
     }
 
-    static func notificationStatus() async -> String {
-        let settings = await UNUserNotificationCenter.current().notificationSettings()
-        switch settings.authorizationStatus {
-        case .authorized, .provisional, .ephemeral: return "granted"
-        case .denied: return "denied"
-        case .notDetermined: return "not requested"
-        @unknown default: return "unknown"
-        }
-    }
-
-    static func openAccessibilitySettings() {
-        openSettings("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-    }
-
     static func openMicrophoneSettings() {
         openSettings("x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone")
-    }
-
-    static func openInputMonitoringSettings() {
-        openSettings("x-apple.systempreferences:com.apple.preference.security?Privacy_ListenEvent")
     }
 
     // MARK: - Python deps check

@@ -6,6 +6,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SWIFT_DIR="$ROOT_DIR/macos/VoiceActivator"
 COMPOSE_FILE="$ROOT_DIR/docker-compose.yml"
 APP_URL="http://127.0.0.1:8080"
+APP_NAME="VoiceActivator.app"
+APP_BUNDLE="/Applications/$APP_NAME"
+BUILD_APP="$SWIFT_DIR/.build/release/$APP_NAME"
+APP_SUPPORT="$HOME/Library/Application Support/VoiceModule"
+VENV_PYTHON="$APP_SUPPORT/venv/bin/python3"
 
 fail() {
     echo "ERROR: $*" >&2
@@ -25,6 +30,52 @@ build_swift() {
     echo "==> Building VoiceActivator.app..."
     (cd "$SWIFT_DIR" && swift build -c release) || fail "Swift build failed."
     echo "[PASS] Swift build"
+}
+
+package_app() {
+    local contents="$BUILD_APP/Contents"
+    rm -rf "$BUILD_APP"
+    mkdir -p "$contents/MacOS" "$contents/Resources/client"
+    cp "$SWIFT_DIR/.build/release/VoiceActivator" "$contents/MacOS/VoiceActivator"
+    cp "$ROOT_DIR/client/voice_client.py" "$contents/Resources/client/voice_client.py"
+    cp "$ROOT_DIR/client/requirements.txt" "$contents/Resources/client/requirements.txt"
+    cat > "$contents/Info.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleDisplayName</key><string>VoiceActivator</string>
+  <key>CFBundleExecutable</key><string>VoiceActivator</string>
+  <key>CFBundleIdentifier</key><string>com.mathisnaud.VoiceActivator</string>
+  <key>CFBundleName</key><string>VoiceActivator</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSUIElement</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>VoiceActivator records audio while you use its dictation shortcut.</string>
+</dict></plist>
+EOF
+    codesign --force --deep --sign - "$BUILD_APP"
+}
+
+install_native() {
+    build_swift
+    package_app
+    mkdir -p "$APP_SUPPORT"
+    local host_python
+    host_python="$(command -v python3)" || fail "python3 was not found on PATH."
+    if [ ! -x "$VENV_PYTHON" ]; then
+        "$host_python" -m venv "$APP_SUPPORT/venv"
+    fi
+    if "$VENV_PYTHON" -c 'import importlib.util; names = ("numpy", "sounddevice", "pynput", "websocket", "requests", "mlx_audio"); raise SystemExit(any(importlib.util.find_spec(name) is None for name in names))'; then
+        echo "[PASS] Existing worker dependencies"
+    else
+        "$VENV_PYTHON" -m pip install -r "$ROOT_DIR/client/requirements.txt"
+    fi
+    rm -rf "$APP_BUNDLE"
+    cp -R "$BUILD_APP" "$APP_BUNDLE"
+    echo "Installed: $APP_BUNDLE"
+    echo "The first transcription downloads the local Voxtral model."
+    echo "Open the app, then grant Microphone permission when prompted."
 }
 
 verify() {
@@ -92,6 +143,9 @@ case "$MODE" in
         compose up -d --build
         echo "Docker backend starting: $APP_URL"
         ;;
+    --install|install)
+        install_native
+        ;;
     --stop|stop)
         pkill -f VoiceActivator 2>/dev/null || true
         if command -v docker >/dev/null 2>&1; then
@@ -100,7 +154,7 @@ case "$MODE" in
         echo "Stopped."
         ;;
     *)
-        echo "usage: $0 [build|run|--verify|--backend|--stop]" >&2
+        echo "usage: $0 [build|run|--verify|--backend|--install|--stop]" >&2
         exit 2
         ;;
 esac

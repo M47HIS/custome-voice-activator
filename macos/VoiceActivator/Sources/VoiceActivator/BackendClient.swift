@@ -23,11 +23,11 @@ enum BackendError: Error, LocalizedError {
 // MARK: - BackendClient
 
 /// Owns all network I/O to the headless FastAPI backend:
-///  * REST: GET /api/settings, GET /api/actions, POST /api/settings, GET /api/status, GET /api/config
+///  * REST: authenticated settings, actions, and config; public loopback health status
 ///  * WebSocket: /ws
 ///
-/// The auth token is loaded from disk on init, or fetched from /api/config
-/// (which is itself unauthenticated) on first run.
+/// The auth token is provisioned locally and never fetched over an
+/// unauthenticated network bootstrap.
 @MainActor
 final class BackendClient: ObservableObject {
     @Published private(set) var status: BackendStatus = BackendStatus(state: "offline")
@@ -55,27 +55,14 @@ final class BackendClient: ObservableObject {
 
     // MARK: - Auth token
 
-    /// Try local cached token first; fall back to /api/config (which returns
-    /// the token without requiring auth). The Python client follows the same
-    /// pattern.
+    /// Load a token that the local user provisioned explicitly.
     func ensureAuthToken() async {
         if let cached = readCachedToken(), !cached.isEmpty {
             self.authToken = cached
             LogStore.shared.log("Auth token loaded from cache.")
             return
         }
-        do {
-            let cfg = try await fetchConfig()
-            if let token = cfg.auth_token, !token.isEmpty {
-                self.authToken = token
-                persistToken(token)
-                LogStore.shared.log("Auth token fetched from backend and cached.")
-            } else {
-                LogStore.shared.warn("Backend returned empty auth_token.")
-            }
-        } catch {
-            LogStore.shared.warn("Could not fetch /api/config for token: \(error.localizedDescription)")
-        }
+        LogStore.shared.warn("No local backend auth token is configured.")
     }
 
     private func readCachedToken() -> String? {
@@ -87,6 +74,10 @@ final class BackendClient: ObservableObject {
     private func persistToken(_ token: String) {
         do {
             try token.write(to: AppPaths.authTokenFile, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: AppPaths.authTokenFile.path
+            )
         } catch {
             LogStore.shared.error("Failed to cache auth token: \(error.localizedDescription)")
         }
@@ -98,6 +89,7 @@ final class BackendClient: ObservableObject {
         let url = baseURL.appendingPathComponent("/api/settings")
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
+        try authorize(&req)
         let (data, response) = try await session.data(for: req)
         try Self.validate(response: response, data: data)
         do {
@@ -114,9 +106,7 @@ final class BackendClient: ObservableObject {
         var req = URLRequest(url: url)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if let token = authToken {
-            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        }
+        try authorize(&req)
         req.httpBody = try JSONEncoder().encode(newSettings)
         let (data, response) = try await session.data(for: req)
         try Self.validate(response: response, data: data)
@@ -133,6 +123,7 @@ final class BackendClient: ObservableObject {
         let url = baseURL.appendingPathComponent("/api/actions")
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
+        try authorize(&req)
         let (data, response) = try await session.data(for: req)
         try Self.validate(response: response, data: data)
         do {
@@ -165,6 +156,7 @@ final class BackendClient: ObservableObject {
         let url = baseURL.appendingPathComponent("/api/config")
         var req = URLRequest(url: url)
         req.httpMethod = "GET"
+        try authorize(&req)
         let (data, response) = try await session.data(for: req)
         try Self.validate(response: response, data: data)
         do {
@@ -184,14 +176,27 @@ final class BackendClient: ObservableObject {
         }
     }
 
+    private func authorize(_ request: inout URLRequest) throws {
+        guard let token = authToken, !token.isEmpty else {
+            throw BackendError.missingAuthToken
+        }
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+    }
+
     // MARK: - WebSocket
 
     /// Open (or reopen) the WebSocket and return an AsyncStream of status
     /// messages. The caller is expected to consume the stream; cancellation
     /// of the consuming Task tears down the underlying socket.
     func connectWebSocket() -> AsyncStream<URLSessionWebSocketTask.Message> {
+        guard let token = authToken, !token.isEmpty else {
+            LogStore.shared.warn("WebSocket disabled because no backend auth token is configured.")
+            return AsyncStream { continuation in continuation.finish() }
+        }
         let wsURL = URL(string: "ws://127.0.0.1:8080/ws")!
-        let task = session.webSocketTask(with: wsURL)
+        var request = URLRequest(url: wsURL)
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let task = session.webSocketTask(with: request)
         self.webSocketTask = task
         task.resume()
 

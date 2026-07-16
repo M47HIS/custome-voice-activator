@@ -1,20 +1,22 @@
 import AppKit
 import Combine
-import Foundation
 import SwiftUI
 
-/// Owns the NSStatusItem. Kept as a singleton because there is only ever one
-/// menu bar icon for the app and we want it addressable from any code path
-/// (e.g. the Settings window's "reveal in Finder" actions).
 @MainActor
-final class StatusBarController {
+final class StatusBarController: NSObject {
     static let shared = StatusBarController()
 
     private var statusItem: NSStatusItem?
-    private var hostingView: NSHostingView<AnyView>?
+    private let popover = NSPopover()
+    private var overlayPanel: NSPanel?
     private var cancellables = Set<AnyCancellable>()
 
-    private init() {}
+    private override init() {
+        super.init()
+        popover.behavior = .transient
+        popover.animates = !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        popover.contentSize = NSSize(width: 300, height: 205)
+    }
 
     func install(
         supervisor: ProcessSupervisor,
@@ -22,87 +24,105 @@ final class StatusBarController {
         settings: SettingsStore
     ) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        self.statusItem = item
-
-        // The icon is bound to supervisor.statusIconName so SwiftUI updates
-        // flow into AppKit's status bar button.
+        statusItem = item
         item.button?.imagePosition = .imageOnly
-
-        // Build the SwiftUI menu content. We re-publish to drive the menu
-        // by simply replacing the menu on the status item whenever the
-        // supervisor state changes — AppKit re-renders.
-        let root = AnyView(
-            MenuContentView()
-                .environmentObject(supervisor)
-                .environmentObject(backend)
-                .environmentObject(settings)
-        )
-
-        // Build a host view that renders nothing visible — the menu bar
-        // icon is the only persistent UI. The hosting view is what
-        // allows us to read `supervisor.statusIconName` (an @Published
-        // value) and keep NSStatusItem.button.image in sync.
-        let host = NSHostingView(rootView: root)
-        host.frame = .zero
-        self.hostingView = host
-
-        // Observe icon name and re-apply to NSStatusItem button.
-        supervisor.$statusIconName
-            .receive(on: RunLoop.main)
-            .sink { [weak self] name in
-                self?.applyIcon(name: name)
-            }
-            .store(in: &cancellables)
-
-        supervisor.$menuState
-            .receive(on: RunLoop.main)
-            .sink { [weak self] _ in
-                self?.refreshMenu(supervisor: supervisor, backend: backend, settings: settings)
-            }
-            .store(in: &cancellables)
-
-        applyIcon(name: supervisor.statusIconName)
-        refreshMenu(supervisor: supervisor, backend: backend, settings: settings)
-
-        // Click behaviour: a normal left click opens the menu (the default).
         item.button?.target = self
-        item.button?.action = #selector(handleClick(_:))
-    }
+        item.button?.action = #selector(togglePopover(_:))
+        item.button?.sendAction(on: [.leftMouseUp])
 
-    @objc private func handleClick(_ sender: NSStatusBarButton) {
-        // Default behaviour: status item shows its menu. Action just exists
-        // so the button is not "disabled".
-    }
-
-    private func applyIcon(name: String) {
-        guard let button = statusItem?.button else { return }
-        let config = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
-        if let image = NSImage(systemSymbolName: name, accessibilityDescription: "Voice Module") {
-            image.isTemplate = true
-            button.image = image.withSymbolConfiguration(config)
-        } else {
-            button.image = NSImage(systemSymbolName: "waveform.circle", accessibilityDescription: "Voice Module")
-        }
-    }
-
-    private func refreshMenu(
-        supervisor: ProcessSupervisor,
-        backend: BackendClient,
-        settings: SettingsStore
-    ) {
-        let view = MenuContentView()
+        let content = MenuContentView()
             .environmentObject(supervisor)
             .environmentObject(backend)
             .environmentObject(settings)
+        popover.contentViewController = NSHostingController(rootView: AnyView(content))
 
-        let host = NSHostingController(rootView: AnyView(view))
-        host.view.frame = NSRect(x: 0, y: 0, width: 280, height: 1)
+        supervisor.$menuState
+            .receive(on: RunLoop.main)
+            .sink { [weak self] state in
+                self?.applyIcon(name: state.iconName, label: state.label)
+                self?.updateOverlay(for: state)
+            }
+            .store(in: &cancellables)
 
-        let menu = NSMenu()
-        let menuItem = NSMenuItem()
-        menuItem.view = host.view
-        menu.addItem(menuItem)
+        applyIcon(name: supervisor.statusIconName, label: supervisor.menuState.label)
+    }
 
-        statusItem?.menu = menu
+    func dismissPopover() {
+        popover.performClose(nil)
+    }
+
+    @objc private func togglePopover(_ sender: NSStatusBarButton) {
+        if popover.isShown {
+            popover.performClose(sender)
+        } else {
+            popover.show(relativeTo: sender.bounds, of: sender, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
+        }
+    }
+
+    private func applyIcon(name: String, label: String) {
+        guard let button = statusItem?.button else { return }
+        let config = NSImage.SymbolConfiguration(pointSize: 16, weight: .regular)
+        let image = NSImage(systemSymbolName: name, accessibilityDescription: "VoiceActivator: \(label)")
+            ?? NSImage(systemSymbolName: "waveform.circle", accessibilityDescription: "VoiceActivator")
+        image?.isTemplate = true
+        button.image = image?.withSymbolConfiguration(config)
+        button.toolTip = "VoiceActivator: \(label)"
+    }
+
+    private func updateOverlay(for state: MenuState) {
+        guard state.showsOverlay else {
+            overlayPanel?.orderOut(nil)
+            return
+        }
+
+        let panel = overlayPanel ?? makeOverlayPanel()
+        panel.contentViewController = NSHostingController(rootView: RecordingOverlayView(state: state))
+        positionOverlay(panel)
+        panel.orderFrontRegardless()
+    }
+
+    private func makeOverlayPanel() -> NSPanel {
+        let panel = NSPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 280, height: 56),
+            styleMask: [.borderless, .nonactivatingPanel],
+            backing: .buffered,
+            defer: false
+        )
+        panel.level = .floating
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.ignoresMouseEvents = true
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        overlayPanel = panel
+        return panel
+    }
+
+    private func positionOverlay(_ panel: NSPanel) {
+        guard let button = statusItem?.button, let window = button.window else { return }
+        let anchor = window.convertToScreen(button.frame)
+        panel.setFrameOrigin(NSPoint(
+            x: anchor.midX - panel.frame.width / 2,
+            y: anchor.minY - panel.frame.height - 8
+        ))
+    }
+}
+
+private struct RecordingOverlayView: View {
+    let state: MenuState
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: state.iconName)
+                .foregroundStyle(state.tint)
+            Text(state.label)
+                .font(.system(size: 13, weight: .medium))
+                .lineLimit(2)
+        }
+        .padding(.horizontal, 14)
+        .frame(width: 280, height: 56)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
+        .accessibilityElement(children: .combine)
     }
 }

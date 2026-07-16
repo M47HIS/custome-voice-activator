@@ -14,6 +14,9 @@ services:
       - WHISPER_DEVICE=${WHISPER_DEVICE:-cpu}
       - WHISPER_COMPUTE=${WHISPER_COMPUTE:-int8}
       - TRANSCRIBE_COMMAND=${TRANSCRIBE_COMMAND:-}
+      - VOICE_MODULE_AUTH_TOKEN=${VOICE_MODULE_AUTH_TOKEN:-}
+      - MAX_UPLOAD_BYTES=${MAX_UPLOAD_BYTES:-26214400}
+      - MAX_TRANSCRIPTIONS_PER_MINUTE=${MAX_TRANSCRIPTIONS_PER_MINUTE:-10}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/api/status"]

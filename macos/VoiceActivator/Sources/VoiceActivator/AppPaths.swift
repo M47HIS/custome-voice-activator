@@ -12,6 +12,8 @@ enum AppPaths {
 
     static let authTokenFile: URL = appSupportDir.appendingPathComponent("auth_token")
     static let voiceClientPIDFile: URL = appSupportDir.appendingPathComponent("voice_client.pid")
+    static let pythonVirtualEnvDir: URL = appSupportDir.appendingPathComponent("venv", isDirectory: true)
+    static let pythonVirtualEnvExecutable: URL = pythonVirtualEnvDir.appendingPathComponent("bin/python3")
 
     static let logDir: URL = {
         let base = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
@@ -27,6 +29,20 @@ enum AppPaths {
         URL(fileURLWithPath: NSHomeDirectory())
             .appendingPathComponent(".config/voice-module", isDirectory: true)
     }()
+    static let pythonConfigFile: URL = pythonConfigDir.appendingPathComponent("config.json")
+
+    /// The installed app carries the worker in its bundle. Development builds
+    /// keep using the repository copy so the normal SwiftPM workflow works.
+    static func workerScript(repoRoot: URL?) -> URL? {
+        if let bundled = Bundle.main.resourceURL?
+            .appendingPathComponent("client/voice_client.py"),
+           FileManager.default.fileExists(atPath: bundled.path) {
+            return bundled
+        }
+        guard let repoRoot else { return nil }
+        let development = repoRoot.appendingPathComponent("client/voice_client.py")
+        return FileManager.default.fileExists(atPath: development.path) ? development : nil
+    }
 
     /// ~/.local/log/voice-module — Python client logs.
     static let pythonLogDir: URL = {
@@ -37,7 +53,7 @@ enum AppPaths {
     @discardableResult
     static func ensureDirectories() -> Bool {
         let fm = FileManager.default
-        for dir in [appSupportDir, logDir] {
+        for dir in [appSupportDir, logDir, pythonConfigDir] {
             do {
                 try fm.createDirectory(at: dir, withIntermediateDirectories: true)
             } catch {
